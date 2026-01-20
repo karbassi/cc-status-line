@@ -70,30 +70,22 @@ format_duration() {
     fi
 }
 
-# Fish-style path abbreviation
-# /Users/ali/Projects/foo/bar/baz -> f/b/baz (if >3 segments or >20 chars)
+# Path abbreviation - show last 2 segments
+# ~/Projects/personal/cc-status-line -> personal/cc-status-line
 abbreviate_path() {
     local path="$1"
     local segments
     IFS='/' read -ra segments <<< "$path"
     local count=${#segments[@]}
 
-    # If short enough, return as-is
-    if [[ ${#path} -le 20 && $count -le 3 ]]; then
+    # If 2 or fewer segments, return as-is
+    if [[ $count -le 2 ]]; then
         echo "$path"
         return
     fi
 
-    # Abbreviate: keep last segment full, abbreviate others to first char
-    local result=""
-    for ((i=0; i<count-1; i++)); do
-        local seg="${segments[$i]}"
-        if [[ -n "$seg" ]]; then
-            result+="${seg:0:1}/"
-        fi
-    done
-    result+="${segments[$count-1]}"
-    echo "$result"
+    # Return last 2 segments
+    echo "${segments[$count-2]}/${segments[$count-1]}"
 }
 
 # ═══════════════════════════════════════════════════════════════════
