@@ -49,13 +49,41 @@ A lightweight, fast status line for Claude Code CLI.
   - Teal `#2ac3de` - context %
   - Gray `#565f89` - muted/session
 
+## Performance
+
+Benchmarked with hyperfine (20 runs, same JSON input):
+
+| Version | Time | Speedup |
+|---------|------|---------|
+| Bash | 73 ms | baseline |
+| Rust | 14 ms | 5x faster |
+| Rust + cache | 6.6 ms | 11x faster |
+
+The Rust version uses libgit2 (statically linked) and mmap-based caching to avoid subprocess overhead.
+
+### Cache modes
+
+```bash
+# Full git stats (default)
+./cc-statusline
+
+# With mmap cache (fastest, skips git discovery + diff when unchanged)
+CC_STATUS_CACHE=1 ./cc-statusline
+
+# Fast mode (status-based file count, no line stats)
+CC_STATUS_FAST=1 ./cc-statusline
+
+# Minimal mode (branch only, no stats)
+CC_STATUS_MINIMAL=1 ./cc-statusline
+```
+
 ## Development
 
 ### Phase 1: Bash prototype
 Quick iteration on design and features.
 
 ### Phase 2: Rust rewrite
-For performance (<1% CPU, <3ms startup).
+For performance (<1% CPU, <10ms startup).
 
 ## Installation
 
