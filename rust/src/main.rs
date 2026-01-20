@@ -1,5 +1,6 @@
 use git2::{DiffOptions, Repository};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::env;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
@@ -85,12 +86,10 @@ fn main() {
 
     let data: ClaudeInput = serde_json::from_str(&input).unwrap_or_default();
 
-    let current_dir = data
-        .workspace
-        .current_dir
-        .as_deref()
-        .map(String::from)
-        .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
+    let current_dir: Cow<str> = match data.workspace.current_dir.as_deref() {
+        Some(dir) => Cow::Borrowed(dir),
+        None => Cow::Owned(env::current_dir().unwrap().to_string_lossy().into_owned()),
+    };
 
     let term_width: usize = env::var("CC_STATUS_WIDTH")
         .ok()
@@ -126,10 +125,10 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str, term
         .unwrap_or_default();
 
     let home = env::var("HOME").unwrap_or_default();
-    let display_cwd = if !home.is_empty() && current_dir.starts_with(&home) {
-        format!("~{}", &current_dir[home.len()..])
+    let display_cwd: Cow<str> = if !home.is_empty() && current_dir.starts_with(&home) {
+        Cow::Owned(format!("~{}", &current_dir[home.len()..]))
     } else {
-        current_dir.to_string()
+        Cow::Borrowed(&current_dir)
     };
 
     let path_width = term_width.saturating_sub(project_name.len()).saturating_sub(3).max(10);
@@ -138,16 +137,16 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str, term
     writeln!(out, "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}").unwrap_or_default();
 }
 
-fn abbreviate_path(path: &str, max_width: usize) -> String {
+fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     if path.len() <= max_width {
-        return path.to_string();
+        return Cow::Borrowed(path);
     }
 
     let segments: Vec<&str> = path.split('/').collect();
     let count = segments.len();
 
     if count < 2 {
-        return path.to_string();
+        return Cow::Borrowed(path);
     }
 
     let mut result = String::with_capacity(max_width + 10);
@@ -174,7 +173,7 @@ fn abbreviate_path(path: &str, max_width: usize) -> String {
         result.push_str(segments[count - 1]);
     }
 
-    result
+    Cow::Owned(result)
 }
 
 fn get_git_info(dir: &str) -> GitInfo {
