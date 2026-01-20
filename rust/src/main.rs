@@ -185,26 +185,31 @@ fn get_git_info(dir: &str) -> GitInfo {
         Err(_) => return info,
     };
 
-    // Get branch name
-    if let Ok(head) = repo.head() {
-        if head.is_branch() {
-            info.branch = head.shorthand().map(String::from);
-        }
-    }
+    // Get HEAD once and reuse
+    let head = match repo.head() {
+        Ok(h) => h,
+        Err(_) => return info,
+    };
 
-    if info.branch.is_none() {
+    // Get branch name
+    if !head.is_branch() {
         return info;
     }
+    let branch_name = match head.shorthand() {
+        Some(name) => name,
+        None => return info,
+    };
+    info.branch = Some(branch_name.to_owned());
 
     // Check for worktree
     if repo.is_worktree() {
         if let Some(name) = repo.path().parent().and_then(|p| p.file_name()) {
-            info.worktree = Some(name.to_string_lossy().to_string());
+            info.worktree = Some(name.to_string_lossy().into_owned());
         }
     }
 
     // Get diff stats (staged + unstaged vs HEAD)
-    if let Ok(head_commit) = repo.head().and_then(|h| h.peel_to_commit()) {
+    if let Ok(head_commit) = head.peel_to_commit() {
         if let Ok(head_tree) = head_commit.tree() {
             let mut opts = DiffOptions::new();
             opts.include_untracked(false);
@@ -219,20 +224,14 @@ fn get_git_info(dir: &str) -> GitInfo {
         }
     }
 
-    // Get ahead/behind
-    if let Ok(head) = repo.head() {
-        if let Some(local_oid) = head.target() {
-            // Try to find upstream branch
-            if let Ok(branch) = repo.find_branch(
-                head.shorthand().unwrap_or(""),
-                git2::BranchType::Local,
-            ) {
-                if let Ok(upstream) = branch.upstream() {
-                    if let Some(upstream_oid) = upstream.get().target() {
-                        if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid) {
-                            info.ahead = ahead as u32;
-                            info.behind = behind as u32;
-                        }
+    // Get ahead/behind using cached head
+    if let Some(local_oid) = head.target() {
+        if let Ok(branch) = repo.find_branch(branch_name, git2::BranchType::Local) {
+            if let Ok(upstream) = branch.upstream() {
+                if let Some(upstream_oid) = upstream.get().target() {
+                    if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid) {
+                        info.ahead = ahead as u32;
+                        info.behind = behind as u32;
                     }
                 }
             }
