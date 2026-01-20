@@ -1,4 +1,4 @@
-use git2::{DiffOptions, Repository, StatusOptions};
+use git2::{DiffOptions, Repository};
 use memmap2::{MmapMut, MmapOptions};
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -90,22 +90,6 @@ struct AheadBehind {
     behind: u32,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum GitMode {
-    Full,      // Full diff stats (slowest, most info)
-    Fast,      // Index-based dirty check (fast, shows file count only)
-    Minimal,   // Branch name only (fastest)
-}
-
-fn get_git_mode() -> GitMode {
-    if env::var("CC_STATUS_MINIMAL").is_ok() {
-        GitMode::Minimal
-    } else if env::var("CC_STATUS_FAST").is_ok() {
-        GitMode::Fast
-    } else {
-        GitMode::Full
-    }
-}
 
 /// Binary cache format for mmap (fixed 128 bytes)
 /// Layout:
@@ -201,18 +185,6 @@ struct GitRepo {
 }
 
 impl GitRepo {
-    /// Fast: Check if working directory is dirty using status (no line counts)
-    fn is_dirty_fast(&self) -> Option<u32> {
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(false)
-            .include_ignored(false)
-            .exclude_submodules(true);
-
-        let statuses = self.repo.statuses(Some(&mut opts)).ok()?;
-        let count = statuses.len() as u32;
-        Some(count)
-    }
-
     /// Compute diff stats lazily - this is the expensive operation (~7-9ms)
     fn diff_stats(&self) -> Option<DiffStats> {
         let head = self.repo.head().ok()?;
@@ -280,10 +252,6 @@ fn get_cache_path(git_dir: &str) -> String {
 
 /// Try to load cached git state via mmap
 fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
-    if env::var("CC_STATUS_CACHE").is_err() {
-        return None;
-    }
-
     let cache_path = get_cache_path(git_dir);
     let file = OpenOptions::new().read(true).open(&cache_path).ok()?;
 
@@ -295,10 +263,6 @@ fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
 
 /// Save git state to cache via mmap
 fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
-    if env::var("CC_STATUS_CACHE").is_err() {
-        return;
-    }
-
     let cache_path = get_cache_path(git_dir);
 
     // Create or truncate file
@@ -345,10 +309,6 @@ fn get_head_mtime(git_path: &str) -> u64 {
 
 /// Get cached git info for a working directory
 fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
-    if env::var("CC_STATUS_CACHE").is_err() {
-        return None;
-    }
-
     let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
     let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
 
@@ -376,10 +336,6 @@ fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
 
 /// Cache git info for a working directory
 fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
-    if env::var("CC_STATUS_CACHE").is_err() {
-        return;
-    }
-
     let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
     let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
 
@@ -610,72 +566,54 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         Some(g) => g,
     };
 
-    let mode = get_git_mode();
-
     write!(out, "{TN_PURPLE}{}{RESET}", git.branch).unwrap_or_default();
 
     if let Some(wt) = &git.worktree {
         write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
     }
 
-    // Mode-dependent diff computation
-    match mode {
-        GitMode::Minimal => {
-            // Branch only - skip all diff/status checks
+    // Try mmap cache first
+    let cache = load_mmap_cache(&git.git_dir);
+    let current_mtime = git.index_mtime();
+    let current_oid = git.head_oid();
+
+    let (files_changed, lines_added, lines_deleted, ahead, behind) =
+        if let Some(ref c) = cache {
+            if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
+                // Cache hit - use mmap'd values directly
+                (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
+            } else {
+                // Cache miss - compute fresh
+                compute_and_cache_git_stats(git, current_mtime, &current_oid)
+            }
+        } else {
+            // No cache - compute fresh
+            compute_and_cache_git_stats(git, current_mtime, &current_oid)
+        };
+
+    if files_changed > 0 || lines_added > 0 || lines_deleted > 0 {
+        write!(out, "{SEP}").unwrap_or_default();
+        if files_changed > 0 {
+            write!(out, "{TN_GRAY}{files_changed} files{RESET}").unwrap_or_default();
         }
-        GitMode::Fast => {
-            // Fast: use git status for file count only (no line counts)
-            if let Some(count) = git.is_dirty_fast() {
-                if count > 0 {
-                    write!(out, "{SEP}{TN_GRAY}{count} files{RESET}").unwrap_or_default();
-                }
-            }
+        if lines_added > 0 {
+            if files_changed > 0 { write!(out, " ").unwrap_or_default(); }
+            write!(out, "{TN_GREEN}+{lines_added}{RESET}").unwrap_or_default();
         }
-        GitMode::Full => {
-            // Try mmap cache first
-            let cache = load_mmap_cache(&git.git_dir);
-            let current_mtime = git.index_mtime();
-            let current_oid = git.head_oid();
+        if lines_deleted > 0 {
+            if files_changed > 0 || lines_added > 0 { write!(out, " ").unwrap_or_default(); }
+            write!(out, "{TN_RED}-{lines_deleted}{RESET}").unwrap_or_default();
+        }
+    }
 
-            let (files_changed, lines_added, lines_deleted, ahead, behind) =
-                if let Some(ref c) = cache {
-                    if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
-                        // Cache hit - use mmap'd values directly
-                        (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
-                    } else {
-                        // Cache miss - compute fresh
-                        compute_and_cache_git_stats(git, current_mtime, &current_oid)
-                    }
-                } else {
-                    // No cache - compute fresh
-                    compute_and_cache_git_stats(git, current_mtime, &current_oid)
-                };
-
-            if files_changed > 0 || lines_added > 0 || lines_deleted > 0 {
-                write!(out, "{SEP}").unwrap_or_default();
-                if files_changed > 0 {
-                    write!(out, "{TN_GRAY}{files_changed} files{RESET}").unwrap_or_default();
-                }
-                if lines_added > 0 {
-                    if files_changed > 0 { write!(out, " ").unwrap_or_default(); }
-                    write!(out, "{TN_GREEN}+{lines_added}{RESET}").unwrap_or_default();
-                }
-                if lines_deleted > 0 {
-                    if files_changed > 0 || lines_added > 0 { write!(out, " ").unwrap_or_default(); }
-                    write!(out, "{TN_RED}-{lines_deleted}{RESET}").unwrap_or_default();
-                }
-            }
-
-            if ahead > 0 || behind > 0 {
-                write!(out, "{SEP}").unwrap_or_default();
-                if ahead > 0 {
-                    write!(out, "{TN_GRAY}↑{ahead}{RESET}").unwrap_or_default();
-                }
-                if behind > 0 {
-                    if ahead > 0 { write!(out, " ").unwrap_or_default(); }
-                    write!(out, "{TN_GRAY}↓{behind}{RESET}").unwrap_or_default();
-                }
-            }
+    if ahead > 0 || behind > 0 {
+        write!(out, "{SEP}").unwrap_or_default();
+        if ahead > 0 {
+            write!(out, "{TN_GRAY}↑{ahead}{RESET}").unwrap_or_default();
+        }
+        if behind > 0 {
+            if ahead > 0 { write!(out, " ").unwrap_or_default(); }
+            write!(out, "{TN_GRAY}↓{behind}{RESET}").unwrap_or_default();
         }
     }
 

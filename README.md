@@ -58,23 +58,7 @@ Benchmarked with hyperfine (20 runs, same JSON input):
 | Bash | 73 ms | baseline |
 | Rust | 6.6 ms | 11x faster |
 
-The Rust version uses libgit2 (statically linked) and mmap-based caching to avoid subprocess overhead.
-
-### Cache modes
-
-```bash
-# Full git stats (default)
-./cc-statusline
-
-# With mmap cache (fastest, skips git discovery + diff when unchanged)
-CC_STATUS_CACHE=1 ./cc-statusline
-
-# Fast mode (status-based file count, no line stats)
-CC_STATUS_FAST=1 ./cc-statusline
-
-# Minimal mode (branch only, no stats)
-CC_STATUS_MINIMAL=1 ./cc-statusline
-```
+The Rust version uses libgit2 (statically linked) and mmap-based caching to avoid subprocess overhead. Caching is automatic and invalidates when git state changes.
 
 ## Development
 
