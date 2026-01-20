@@ -333,7 +333,6 @@ fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
 struct GitPathCache {
     git_path: String,
     branch: String,
-    head_mtime: u64,
 }
 
 fn get_head_mtime(git_path: &str) -> u64 {
@@ -372,7 +371,7 @@ fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
         return None; // Cache invalid, need to re-read branch
     }
 
-    Some(GitPathCache { git_path, branch, head_mtime: cached_mtime })
+    Some(GitPathCache { git_path, branch })
 }
 
 /// Cache git info for a working directory
