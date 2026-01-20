@@ -1,9 +1,8 @@
+use git2::{DiffOptions, Repository};
 use serde::Deserialize;
 use std::env;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::Command;
-use std::thread;
 
 // Tokyo Night Dim Colors
 const RESET: &str = "\x1b[0m";
@@ -104,7 +103,7 @@ fn main() {
     // Row 1: Location
     write_row1(&mut out, &data, &current_dir, term_width);
 
-    // Row 2: Git (parallel fetch)
+    // Row 2: Git
     let git_info = get_git_info(&current_dir);
     write_row2(&mut out, &git_info);
 
@@ -151,7 +150,6 @@ fn abbreviate_path(path: &str, max_width: usize) -> String {
         return path.to_string();
     }
 
-    // Try keeping last 2 segments full
     let mut result = String::with_capacity(max_width + 10);
     for seg in &segments[..count.saturating_sub(2)] {
         if let Some(c) = seg.chars().next() {
@@ -182,105 +180,64 @@ fn abbreviate_path(path: &str, max_width: usize) -> String {
 fn get_git_info(dir: &str) -> GitInfo {
     let mut info = GitInfo::default();
 
-    // Get branch first (required for other operations)
-    let branch_output = Command::new("git")
-        .args(["-C", dir, "branch", "--show-current"])
-        .output();
-
-    let branch = match branch_output {
-        Ok(output) if output.status.success() => {
-            let b = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if b.is_empty() { None } else { Some(b) }
-        }
-        _ => None,
+    let repo = match Repository::discover(dir) {
+        Ok(r) => r,
+        Err(_) => return info,
     };
 
-    if branch.is_none() {
+    // Get branch name
+    if let Ok(head) = repo.head() {
+        if head.is_branch() {
+            info.branch = head.shorthand().map(String::from);
+        }
+    }
+
+    if info.branch.is_none() {
         return info;
     }
-    info.branch = branch;
 
-    // Run remaining git commands in parallel
-    let dir_owned = dir.to_string();
-    let dir2 = dir_owned.clone();
-    let dir3 = dir_owned.clone();
+    // Check for worktree
+    if repo.is_worktree() {
+        if let Some(name) = repo.path().parent().and_then(|p| p.file_name()) {
+            info.worktree = Some(name.to_string_lossy().to_string());
+        }
+    }
 
-    let worktree_handle = thread::spawn(move || {
-        Command::new("git")
-            .args(["-C", &dir_owned, "rev-parse", "--git-dir"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| {
-                let git_dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if git_dir.contains(".git/worktrees/") {
-                    Path::new(&git_dir).file_name().map(|n| n.to_string_lossy().to_string())
-                } else {
-                    None
+    // Get diff stats (staged + unstaged vs HEAD)
+    if let Ok(head_commit) = repo.head().and_then(|h| h.peel_to_commit()) {
+        if let Ok(head_tree) = head_commit.tree() {
+            let mut opts = DiffOptions::new();
+            opts.include_untracked(false);
+
+            if let Ok(diff) = repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts)) {
+                if let Ok(stats) = diff.stats() {
+                    info.files_changed = stats.files_changed() as u32;
+                    info.lines_added = stats.insertions() as u32;
+                    info.lines_deleted = stats.deletions() as u32;
                 }
-            })
-    });
+            }
+        }
+    }
 
-    let diff_handle = thread::spawn(move || {
-        let output = Command::new("git")
-            .args(["-C", &dir2, "diff", "--numstat", "HEAD"])
-            .output()
-            .or_else(|_| Command::new("git").args(["-C", &dir2, "diff", "--numstat"]).output());
-
-        let mut files = 0u32;
-        let mut added = 0u32;
-        let mut deleted = 0u32;
-
-        if let Ok(o) = output {
-            if o.status.success() {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    let mut parts = line.split('\t');
-                    if let (Some(a), Some(d)) = (parts.next(), parts.next()) {
-                        if let Ok(a_num) = a.parse::<u32>() {
-                            added += a_num;
-                            files += 1;
-                        }
-                        if let Ok(d_num) = d.parse::<u32>() {
-                            deleted += d_num;
+    // Get ahead/behind
+    if let Ok(head) = repo.head() {
+        if let Some(local_oid) = head.target() {
+            // Try to find upstream branch
+            if let Ok(branch) = repo.find_branch(
+                head.shorthand().unwrap_or(""),
+                git2::BranchType::Local,
+            ) {
+                if let Ok(upstream) = branch.upstream() {
+                    if let Some(upstream_oid) = upstream.get().target() {
+                        if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid) {
+                            info.ahead = ahead as u32;
+                            info.behind = behind as u32;
                         }
                     }
                 }
             }
         }
-        (files, added, deleted)
-    });
-
-    let remote_handle = thread::spawn(move || {
-        let upstream = Command::new("git")
-            .args(["-C", &dir3, "rev-parse", "--abbrev-ref", "@{upstream}"])
-            .output();
-
-        if upstream.is_ok_and(|o| o.status.success()) {
-            if let Ok(o) = Command::new("git")
-                .args(["-C", &dir3, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
-                .output()
-            {
-                if o.status.success() {
-                    let s = String::from_utf8_lossy(&o.stdout);
-                    let mut parts = s.trim().split_whitespace();
-                    let ahead = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-                    let behind = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-                    return (ahead, behind);
-                }
-            }
-        }
-        (0, 0)
-    });
-
-    // Collect results
-    info.worktree = worktree_handle.join().unwrap_or(None);
-    let (files, added, deleted) = diff_handle.join().unwrap_or((0, 0, 0));
-    info.files_changed = files;
-    info.lines_added = added;
-    info.lines_deleted = deleted;
-    let (ahead, behind) = remote_handle.join().unwrap_or((0, 0));
-    info.ahead = ahead;
-    info.behind = behind;
+    }
 
     info
 }
