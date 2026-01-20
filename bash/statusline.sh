@@ -22,9 +22,9 @@ TN_RED="\033[2;38;2;247;118;142m"      # deletions
 SEP="${TN_GRAY} • ${RESET}"
 
 # ═══════════════════════════════════════════════════════════════════
-# Terminal width detection (try $COLUMNS first for split panes)
+# Terminal width - use CC_STATUS_WIDTH env var, or default to 50 (works for splits)
 # ═══════════════════════════════════════════════════════════════════
-TERM_WIDTH=${COLUMNS:-$(tput cols 2>/dev/tty 2>/dev/null || stty size </dev/tty 2>/dev/null | cut -d' ' -f2 || echo 80)}
+TERM_WIDTH=${CC_STATUS_WIDTH:-50}
 
 # ═══════════════════════════════════════════════════════════════════
 # Read JSON from stdin
