@@ -1,10 +1,12 @@
-use git2::{DiffOptions, Repository};
+use git2::{DiffOptions, Repository, StatusOptions};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::env;
+use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 
@@ -87,14 +89,58 @@ struct AheadBehind {
     behind: u32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum GitMode {
+    Full,      // Full diff stats (slowest, most info)
+    Fast,      // Index-based dirty check (fast, shows file count only)
+    Minimal,   // Branch name only (fastest)
+}
+
+fn get_git_mode() -> GitMode {
+    if env::var("CC_STATUS_MINIMAL").is_ok() {
+        GitMode::Minimal
+    } else if env::var("CC_STATUS_FAST").is_ok() {
+        GitMode::Fast
+    } else {
+        GitMode::Full
+    }
+}
+
+/// Cached git state for faster subsequent calls
+#[derive(Deserialize, serde::Serialize, Default)]
+struct GitCache {
+    branch: String,
+    worktree: Option<String>,
+    files_changed: u32,
+    lines_added: u32,
+    lines_deleted: u32,
+    ahead: u32,
+    behind: u32,
+    index_mtime: u64,
+    head_oid: String,
+}
+
 /// Holds repository state for lazy evaluation of expensive git operations
 struct GitRepo {
     repo: Repository,
     branch: String,
     worktree: Option<String>,
+    git_dir: String,
 }
 
 impl GitRepo {
+    /// Fast: Check if working directory is dirty using status (no line counts)
+    fn is_dirty_fast(&self) -> Option<u32> {
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(false)
+            .include_ignored(false)
+            .exclude_submodules(true);
+
+        let statuses = self.repo.statuses(Some(&mut opts)).ok()?;
+        let count = statuses.len() as u32;
+        Some(count)
+    }
+
     /// Compute diff stats lazily - this is the expensive operation (~7-9ms)
     fn diff_stats(&self) -> Option<DiffStats> {
         let head = self.repo.head().ok()?;
@@ -127,6 +173,45 @@ impl GitRepo {
             ahead: ahead as u32,
             behind: behind as u32,
         })
+    }
+
+    /// Get index mtime for cache invalidation
+    fn index_mtime(&self) -> u64 {
+        let index_path = format!("{}/index", self.git_dir);
+        fs::metadata(&index_path)
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Get HEAD oid for cache invalidation
+    fn head_oid(&self) -> String {
+        self.repo.head()
+            .ok()
+            .and_then(|h| h.target())
+            .map(|oid| oid.to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// Try to load cached git state
+fn load_git_cache(git_dir: &str) -> Option<GitCache> {
+    if env::var("CC_STATUS_CACHE").is_err() {
+        return None;
+    }
+    let cache_path = format!("/tmp/cc-status-cache-{}.json", git_dir.replace('/', "_"));
+    let content = fs::read_to_string(&cache_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Save git state to cache
+fn save_git_cache(git_dir: &str, cache: &GitCache) {
+    if env::var("CC_STATUS_CACHE").is_err() {
+        return;
+    }
+    let cache_path = format!("/tmp/cc-status-cache-{}.json", git_dir.replace('/', "_"));
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = fs::write(&cache_path, json);
     }
 }
 
@@ -250,6 +335,7 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
 
 fn get_git_repo(dir: &str) -> Option<GitRepo> {
     let repo = Repository::discover(dir).ok()?;
+    let git_dir = repo.path().to_string_lossy().into_owned();
 
     // Extract branch name and worktree info, then drop the borrow
     let (branch, worktree) = {
@@ -268,7 +354,7 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         (branch, worktree)
     };
 
-    Some(GitRepo { repo, branch, worktree })
+    Some(GitRepo { repo, branch, worktree, git_dir })
 }
 
 fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
@@ -280,45 +366,103 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         Some(g) => g,
     };
 
+    let mode = get_git_mode();
+
     write!(out, "{TN_PURPLE}{}{RESET}", git.branch).unwrap_or_default();
 
     if let Some(wt) = &git.worktree {
         write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
     }
 
-    // Lazy: only compute diff stats now (expensive ~7-9ms)
-    if let Some(diff) = git.diff_stats() {
-        if diff.files_changed > 0 || diff.lines_added > 0 || diff.lines_deleted > 0 {
-            write!(out, "{SEP}").unwrap_or_default();
-            if diff.files_changed > 0 {
-                write!(out, "{TN_GRAY}{} files{RESET}", diff.files_changed).unwrap_or_default();
-            }
-            if diff.lines_added > 0 {
-                if diff.files_changed > 0 { write!(out, " ").unwrap_or_default(); }
-                write!(out, "{TN_GREEN}+{}{RESET}", diff.lines_added).unwrap_or_default();
-            }
-            if diff.lines_deleted > 0 {
-                if diff.files_changed > 0 || diff.lines_added > 0 { write!(out, " ").unwrap_or_default(); }
-                write!(out, "{TN_RED}-{}{RESET}", diff.lines_deleted).unwrap_or_default();
+    // Mode-dependent diff computation
+    match mode {
+        GitMode::Minimal => {
+            // Branch only - skip all diff/status checks
+        }
+        GitMode::Fast => {
+            // Fast: use git status for file count only (no line counts)
+            if let Some(count) = git.is_dirty_fast() {
+                if count > 0 {
+                    write!(out, "{SEP}{TN_GRAY}{count} files{RESET}").unwrap_or_default();
+                }
             }
         }
-    }
+        GitMode::Full => {
+            // Try cache first
+            let cache = load_git_cache(&git.git_dir);
+            let current_mtime = git.index_mtime();
+            let current_oid = git.head_oid();
 
-    // Lazy: only compute ahead/behind now (~1-2ms)
-    if let Some(ab) = git.ahead_behind() {
-        if ab.ahead > 0 || ab.behind > 0 {
-            write!(out, "{SEP}").unwrap_or_default();
-            if ab.ahead > 0 {
-                write!(out, "{TN_GRAY}↑{}{RESET}", ab.ahead).unwrap_or_default();
+            let (files_changed, lines_added, lines_deleted, ahead, behind) =
+                if let Some(ref c) = cache {
+                    if c.index_mtime == current_mtime && c.head_oid == current_oid {
+                        // Cache hit
+                        (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
+                    } else {
+                        // Cache miss - compute fresh
+                        compute_and_cache_git_stats(git, current_mtime, &current_oid)
+                    }
+                } else {
+                    // No cache - compute fresh
+                    compute_and_cache_git_stats(git, current_mtime, &current_oid)
+                };
+
+            if files_changed > 0 || lines_added > 0 || lines_deleted > 0 {
+                write!(out, "{SEP}").unwrap_or_default();
+                if files_changed > 0 {
+                    write!(out, "{TN_GRAY}{files_changed} files{RESET}").unwrap_or_default();
+                }
+                if lines_added > 0 {
+                    if files_changed > 0 { write!(out, " ").unwrap_or_default(); }
+                    write!(out, "{TN_GREEN}+{lines_added}{RESET}").unwrap_or_default();
+                }
+                if lines_deleted > 0 {
+                    if files_changed > 0 || lines_added > 0 { write!(out, " ").unwrap_or_default(); }
+                    write!(out, "{TN_RED}-{lines_deleted}{RESET}").unwrap_or_default();
+                }
             }
-            if ab.behind > 0 {
-                if ab.ahead > 0 { write!(out, " ").unwrap_or_default(); }
-                write!(out, "{TN_GRAY}↓{}{RESET}", ab.behind).unwrap_or_default();
+
+            if ahead > 0 || behind > 0 {
+                write!(out, "{SEP}").unwrap_or_default();
+                if ahead > 0 {
+                    write!(out, "{TN_GRAY}↑{ahead}{RESET}").unwrap_or_default();
+                }
+                if behind > 0 {
+                    if ahead > 0 { write!(out, " ").unwrap_or_default(); }
+                    write!(out, "{TN_GRAY}↓{behind}{RESET}").unwrap_or_default();
+                }
             }
         }
     }
 
     writeln!(out).unwrap_or_default();
+}
+
+fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32, u32, u32) {
+    let diff = git.diff_stats();
+    let ab = git.ahead_behind();
+
+    let files_changed = diff.as_ref().map(|d| d.files_changed).unwrap_or(0);
+    let lines_added = diff.as_ref().map(|d| d.lines_added).unwrap_or(0);
+    let lines_deleted = diff.as_ref().map(|d| d.lines_deleted).unwrap_or(0);
+    let ahead = ab.as_ref().map(|a| a.ahead).unwrap_or(0);
+    let behind = ab.as_ref().map(|a| a.behind).unwrap_or(0);
+
+    // Save to cache
+    let cache = GitCache {
+        branch: git.branch.clone(),
+        worktree: git.worktree.clone(),
+        files_changed,
+        lines_added,
+        lines_deleted,
+        ahead,
+        behind,
+        index_mtime: mtime,
+        head_oid: oid.to_string(),
+    };
+    save_git_cache(&git.git_dir, &cache);
+
+    (files_changed, lines_added, lines_deleted, ahead, behind)
 }
 
 fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
