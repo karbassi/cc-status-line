@@ -101,27 +101,21 @@ abbreviate_path() {
 # ═══════════════════════════════════════════════════════════════════
 PROJECT_NAME=$(basename "$PROJECT_DIR" 2>/dev/null || echo "")
 
-# Calculate relative CWD
-if [[ -n "$PROJECT_DIR" && -n "$CURRENT_DIR" ]]; then
-    if [[ "$CURRENT_DIR" == "$PROJECT_DIR" ]]; then
-        REL_CWD="."
-    elif [[ "$CURRENT_DIR" == "$PROJECT_DIR"/* ]]; then
-        REL_CWD="${CURRENT_DIR#$PROJECT_DIR/}"
+# Calculate CWD display - show path relative to home with ~ prefix
+if [[ -n "$CURRENT_DIR" ]]; then
+    # Replace $HOME with ~ for display
+    if [[ "$CURRENT_DIR" == "$HOME"* ]]; then
+        DISPLAY_CWD="~${CURRENT_DIR#$HOME}"
     else
-        REL_CWD="$CURRENT_DIR"
+        DISPLAY_CWD="$CURRENT_DIR"
     fi
 else
-    REL_CWD="."
+    DISPLAY_CWD="."
 fi
 
-ABBREV_CWD=$(abbreviate_path "$REL_CWD")
+ABBREV_CWD=$(abbreviate_path "$DISPLAY_CWD")
 
-# Only show cwd if not at project root
-if [[ "$REL_CWD" == "." ]]; then
-    ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}"
-else
-    ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}${SEP}${TN_CYAN}${ABBREV_CWD}${RESET}"
-fi
+ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}${SEP}${TN_CYAN}${ABBREV_CWD}${RESET}"
 
 # ═══════════════════════════════════════════════════════════════════
 # Row 2: Git (branch • worktree • status • remote)
@@ -208,9 +202,9 @@ BLOCK_TIMER=""
 FIRST_TS=""
 FIRST_EPOCH=""
 if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
-    # Get first timestamp from transcript (grep for first line with timestamp, faster than parsing entire file)
-    FIRST_TS=$(grep -m1 '"timestamp"' "$TRANSCRIPT_PATH" 2>/dev/null | jq -r '.timestamp' 2>/dev/null || echo "")
-    if [[ -n "$FIRST_TS" ]]; then
+    # Get first timestamp from transcript (find first user/assistant message with actual timestamp)
+    FIRST_TS=$(grep -m1 '"type":"user"' "$TRANSCRIPT_PATH" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null)
+    if [[ -n "$FIRST_TS" && "$FIRST_TS" != "null" ]]; then
         # Parse ISO timestamp (format: 2026-01-20T03:13:42.539Z)
         FIRST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${FIRST_TS%%.*}" "+%s" 2>/dev/null || echo "")
         if [[ -n "$FIRST_EPOCH" ]]; then
