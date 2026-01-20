@@ -63,17 +63,25 @@ Optimizations:
 - mmap-based caching (auto-invalidates on git changes)
 - opt-level=s, LTO, panic=abort
 
-## Development
-
-### Phase 1: Bash prototype
-Quick iteration on design and features.
-
-### Phase 2: Rust rewrite
-For performance (<1% CPU, <10ms startup).
-
 ## Installation
 
-TBD
+```bash
+# Build from source
+cd rust
+cargo build --release
+
+# Binary at ./target/release/cc-statusline (~1MB)
+```
+
+### Usage
+
+```bash
+# Run directly
+./target/release/cc-statusline
+
+# Or install to PATH
+cp ./target/release/cc-statusline ~/.local/bin/
+```
 
 ## License
 
