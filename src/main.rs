@@ -192,7 +192,7 @@ impl GitRepo {
 
     /// Get index mtime for cache invalidation
     fn index_mtime(&self) -> u64 {
-        let index_path = format!("{}/index", self.git_dir);
+        let index_path = format!("{}/index", self.git_dir.trim_end_matches('/'));
         fs::metadata(&index_path)
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs())
@@ -201,7 +201,7 @@ impl GitRepo {
 
     /// Get HEAD oid for cache invalidation
     fn head_oid(&self) -> String {
-        let ref_path = format!("{}refs/heads/{}", self.git_dir, self.branch);
+        let ref_path = format!("{}/refs/heads/{}", self.git_dir.trim_end_matches('/'), self.branch);
         if let Ok(oid) = fs::read_to_string(&ref_path) {
             return oid.trim().to_string();
         }
@@ -248,7 +248,7 @@ struct GitPathCache {
 }
 
 fn get_head_mtime(git_path: &str) -> u64 {
-    let head_path = format!("{}HEAD", git_path);
+    let head_path = format!("{}/HEAD", git_path.trim_end_matches('/'));
     fs::metadata(&head_path)
         .and_then(|m| m.modified())
         .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs())
