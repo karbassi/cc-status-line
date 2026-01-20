@@ -32,17 +32,30 @@ TERM_WIDTH=${CC_STATUS_WIDTH:-50}
 INPUT=$(cat)
 
 # ═══════════════════════════════════════════════════════════════════
-# Extract Claude data
+# Extract Claude data (single jq call for performance)
 # ═══════════════════════════════════════════════════════════════════
-MODEL=$(echo "$INPUT" | jq -r '.model.display_name // "Unknown"')
-CONTEXT_PCT=$(echo "$INPUT" | jq -r '.context_window.remaining_percentage // 100' | xargs printf "%.0f")
-INPUT_TOKENS=$(echo "$INPUT" | jq -r '.context_window.total_input_tokens // 0')
-OUTPUT_TOKENS=$(echo "$INPUT" | jq -r '.context_window.total_output_tokens // 0')
-DURATION_MS=$(echo "$INPUT" | jq -r '.cost.total_duration_ms // 0')
-OUTPUT_MODE=$(echo "$INPUT" | jq -r '.output_style.name // "default"')
-PROJECT_DIR=$(echo "$INPUT" | jq -r '.workspace.project_dir // ""')
-CURRENT_DIR=$(echo "$INPUT" | jq -r '.workspace.current_dir // ""')
-TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // ""')
+IFS=$'\t' read -r MODEL CONTEXT_PCT INPUT_TOKENS OUTPUT_TOKENS DURATION_MS OUTPUT_MODE PROJECT_DIR CURRENT_DIR TRANSCRIPT_PATH < <(
+    echo "$INPUT" | jq -r '[
+        (.model.display_name // "Unknown"),
+        ((.context_window.remaining_percentage // 100) | floor),
+        (.context_window.total_input_tokens // 0),
+        (.context_window.total_output_tokens // 0),
+        (.cost.total_duration_ms // 0),
+        (.output_style.name // "default"),
+        (.workspace.project_dir // ""),
+        (.workspace.current_dir // ""),
+        (.transcript_path // "")
+    ] | @tsv'
+)
+
+# Ensure numeric values are valid integers (default to 0)
+[[ ! "$CONTEXT_PCT" =~ ^[0-9]+$ ]] && CONTEXT_PCT=100
+[[ ! "$INPUT_TOKENS" =~ ^[0-9]+$ ]] && INPUT_TOKENS=0
+[[ ! "$OUTPUT_TOKENS" =~ ^[0-9]+$ ]] && OUTPUT_TOKENS=0
+[[ ! "$DURATION_MS" =~ ^[0-9]+$ ]] && DURATION_MS=0
+
+# Fall back to PWD if CURRENT_DIR is empty
+[[ -z "$CURRENT_DIR" ]] && CURRENT_DIR="$PWD"
 
 # ═══════════════════════════════════════════════════════════════════
 # Helper Functions
@@ -93,6 +106,12 @@ abbreviate_path() {
     IFS='/' read -ra segments <<< "$path"
     local count=${#segments[@]}
 
+    # Need at least 2 segments to abbreviate
+    if [[ $count -lt 2 ]]; then
+        echo "$path"
+        return
+    fi
+
     # Try keeping last 2 segments full, abbreviate rest
     local result=""
     for ((i=0; i<count-2; i++)); do
@@ -137,6 +156,7 @@ fi
 
 # Calculate available width for path (terminal width - project name - separator)
 PATH_WIDTH=$((TERM_WIDTH - ${#PROJECT_NAME} - 3))
+[[ $PATH_WIDTH -lt 10 ]] && PATH_WIDTH=10  # Minimum width
 ABBREV_CWD=$(abbreviate_path "$DISPLAY_CWD" "$PATH_WIDTH")
 
 ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}${SEP}${TN_CYAN}${ABBREV_CWD}${RESET}"
@@ -155,21 +175,23 @@ if [[ -n "$GIT_BRANCH" ]]; then
     fi
 fi
 
-# Git status counts
-GIT_ADDED=0
-GIT_MODIFIED=0
-GIT_DELETED=0
-GIT_UNTRACKED=0
+# Git line counts (additions/deletions) and file count
+GIT_LINES_ADDED=0
+GIT_LINES_DELETED=0
+GIT_FILES_CHANGED=0
 
 if [[ -n "$GIT_BRANCH" ]]; then
-    while IFS= read -r line; do
-        case "${line:0:2}" in
-            "A "|"?A") ((GIT_ADDED++)) ;;
-            " M"|"M "|"MM") ((GIT_MODIFIED++)) ;;
-            " D"|"D ") ((GIT_DELETED++)) ;;
-            "??") ((GIT_UNTRACKED++)) ;;
-        esac
-    done < <(git -C "$CURRENT_DIR" status --porcelain 2>/dev/null || true)
+    # Get line counts from both staged and unstaged changes
+    while IFS=$'\t' read -r added deleted _; do
+        # Skip empty lines or binary files (shown as -)
+        [[ -z "$added" || "$added" == "-" ]] && continue
+        # Only count if we have valid numeric data
+        if [[ "$added" =~ ^[0-9]+$ ]]; then
+            ((GIT_LINES_ADDED += added))
+            ((GIT_FILES_CHANGED++))
+        fi
+        [[ "$deleted" =~ ^[0-9]+$ ]] && ((GIT_LINES_DELETED += deleted))
+    done < <(git -C "$CURRENT_DIR" diff --numstat HEAD 2>/dev/null || git -C "$CURRENT_DIR" diff --numstat 2>/dev/null || true)
 fi
 
 # Remote ahead/behind
@@ -194,12 +216,11 @@ if [[ -n "$GIT_BRANCH" ]]; then
         ROW2+="${SEP}${TN_MAGENTA}${GIT_WORKTREE}${RESET}"
     fi
 
-    # Status indicators
+    # File and line change indicators
     STATUS_PARTS=""
-    [[ $GIT_ADDED -gt 0 ]] && STATUS_PARTS+="${TN_GREEN}+${GIT_ADDED}${RESET} "
-    [[ $GIT_MODIFIED -gt 0 ]] && STATUS_PARTS+="${TN_YELLOW}~${GIT_MODIFIED}${RESET} "
-    [[ $GIT_DELETED -gt 0 ]] && STATUS_PARTS+="${TN_RED}-${GIT_DELETED}${RESET} "
-    [[ $GIT_UNTRACKED -gt 0 ]] && STATUS_PARTS+="${TN_GRAY}?${GIT_UNTRACKED}${RESET} "
+    [[ $GIT_FILES_CHANGED -gt 0 ]] && STATUS_PARTS+="${TN_GRAY}${GIT_FILES_CHANGED} files${RESET} "
+    [[ $GIT_LINES_ADDED -gt 0 ]] && STATUS_PARTS+="${TN_GREEN}+${GIT_LINES_ADDED}${RESET} "
+    [[ $GIT_LINES_DELETED -gt 0 ]] && STATUS_PARTS+="${TN_RED}-${GIT_LINES_DELETED}${RESET} "
 
     if [[ -n "$STATUS_PARTS" ]]; then
         ROW2+="${SEP}${STATUS_PARTS% }"
@@ -230,7 +251,9 @@ if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
     FIRST_TS=$(grep -m1 '"type":"user"' "$TRANSCRIPT_PATH" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null)
     if [[ -n "$FIRST_TS" && "$FIRST_TS" != "null" ]]; then
         # Parse ISO timestamp (format: 2026-01-20T03:13:42.539Z)
-        FIRST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${FIRST_TS%%.*}" "+%s" 2>/dev/null || echo "")
+        # Try macOS date first, then GNU date
+        FIRST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${FIRST_TS%%.*}" "+%s" 2>/dev/null || \
+                      date -d "${FIRST_TS}" "+%s" 2>/dev/null || echo "")
         if [[ -n "$FIRST_EPOCH" ]]; then
             NOW_EPOCH=$(date "+%s")
             ELAPSED_SECS=$((NOW_EPOCH - FIRST_EPOCH))

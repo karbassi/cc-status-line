@@ -61,6 +61,10 @@ main() {
 
     check_deps
     ensure_settings_dir
+
+    # Ensure statusline.sh is executable
+    chmod +x "$STATUSLINE_PATH"
+
     update_settings
 
     echo ""
