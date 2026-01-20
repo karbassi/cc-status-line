@@ -116,7 +116,12 @@ fi
 
 ABBREV_CWD=$(abbreviate_path "$REL_CWD")
 
-ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}${SEP}${TN_CYAN}${ABBREV_CWD}${RESET}"
+# Only show cwd if not at project root
+if [[ "$REL_CWD" == "." ]]; then
+    ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}"
+else
+    ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}${SEP}${TN_CYAN}${ABBREV_CWD}${RESET}"
+fi
 
 # ═══════════════════════════════════════════════════════════════════
 # Row 2: Git (branch • worktree • status • remote)
