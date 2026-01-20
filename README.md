@@ -51,12 +51,12 @@ A lightweight, fast status line for Claude Code CLI.
 
 ## Performance
 
-| Version | Time | Binary |
-|---------|------|--------|
-| Bash | 75 ms | - |
-| Rust | ~5 ms | <1 MB |
+| Version | Mean | Min |
+|---------|------|-----|
+| Bash | 80 ms | 59 ms |
+| Rust | 3.7 ms | 3.0 ms |
 
-**17x faster than bash.**
+**20x faster than bash.** Binary <1MB, ~1.4MB RAM.
 
 Optimizations:
 - gix (pure Rust git, minimal features)
