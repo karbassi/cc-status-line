@@ -275,4 +275,7 @@ ROW4+="${SEP}${TN_GRAY}${INPUT_FMT}/${OUTPUT_FMT}${RESET}"
 echo -e "$ROW1"
 echo -e "$ROW2"
 echo -e "$ROW3"
-echo -e "$ROW4"
+# Only show Row 4 when there's actual session data
+if [[ $DURATION_MS -gt 0 || $INPUT_TOKENS -gt 0 || $OUTPUT_TOKENS -gt 0 ]]; then
+    echo -e "$ROW4"
+fi
