@@ -1,8 +1,9 @@
 use git2::{DiffOptions, Repository, StatusOptions};
+use memmap2::{MmapMut, MmapOptions};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -106,18 +107,89 @@ fn get_git_mode() -> GitMode {
     }
 }
 
-/// Cached git state for faster subsequent calls
-#[derive(Deserialize, serde::Serialize, Default)]
-struct GitCache {
-    branch: String,
-    worktree: Option<String>,
+/// Binary cache format for mmap (fixed 128 bytes)
+/// Layout:
+///   0-3:   magic "CCST"
+///   4-7:   version (1)
+///   8-15:  index_mtime (u64 LE)
+///   16-55: head_oid (40 bytes, null-padded)
+///   56-59: files_changed (u32 LE)
+///   60-63: lines_added (u32 LE)
+///   64-67: lines_deleted (u32 LE)
+///   68-71: ahead (u32 LE)
+///   72-75: behind (u32 LE)
+///   76-127: reserved
+const CACHE_SIZE: usize = 128;
+const CACHE_MAGIC: &[u8; 4] = b"CCST";
+const CACHE_VERSION: u32 = 1;
+
+struct MmapCache {
+    index_mtime: u64,
+    head_oid: [u8; 40],
     files_changed: u32,
     lines_added: u32,
     lines_deleted: u32,
     ahead: u32,
     behind: u32,
-    index_mtime: u64,
-    head_oid: String,
+}
+
+impl Default for MmapCache {
+    fn default() -> Self {
+        Self {
+            index_mtime: 0,
+            head_oid: [0u8; 40],
+            files_changed: 0,
+            lines_added: 0,
+            lines_deleted: 0,
+            ahead: 0,
+            behind: 0,
+        }
+    }
+}
+
+impl MmapCache {
+    fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < CACHE_SIZE {
+            return None;
+        }
+        // Check magic
+        if &data[0..4] != CACHE_MAGIC {
+            return None;
+        }
+        // Check version
+        let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        if version != CACHE_VERSION {
+            return None;
+        }
+
+        let mut cache = MmapCache::default();
+        cache.index_mtime = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        cache.head_oid.copy_from_slice(&data[16..56]);
+        cache.files_changed = u32::from_le_bytes(data[56..60].try_into().ok()?);
+        cache.lines_added = u32::from_le_bytes(data[60..64].try_into().ok()?);
+        cache.lines_deleted = u32::from_le_bytes(data[64..68].try_into().ok()?);
+        cache.ahead = u32::from_le_bytes(data[68..72].try_into().ok()?);
+        cache.behind = u32::from_le_bytes(data[72..76].try_into().ok()?);
+
+        Some(cache)
+    }
+
+    fn to_bytes(&self, buf: &mut [u8]) {
+        buf[0..4].copy_from_slice(CACHE_MAGIC);
+        buf[4..8].copy_from_slice(&CACHE_VERSION.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.index_mtime.to_le_bytes());
+        buf[16..56].copy_from_slice(&self.head_oid);
+        buf[56..60].copy_from_slice(&self.files_changed.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.lines_added.to_le_bytes());
+        buf[64..68].copy_from_slice(&self.lines_deleted.to_le_bytes());
+        buf[68..72].copy_from_slice(&self.ahead.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.behind.to_le_bytes());
+    }
+
+    fn head_oid_matches(&self, oid: &str) -> bool {
+        let oid_bytes = oid.as_bytes();
+        oid_bytes.len() <= 40 && self.head_oid[..oid_bytes.len()] == *oid_bytes
+    }
 }
 
 /// Holds repository state for lazy evaluation of expensive git operations
@@ -194,25 +266,61 @@ impl GitRepo {
     }
 }
 
-/// Try to load cached git state
-fn load_git_cache(git_dir: &str) -> Option<GitCache> {
+fn get_cache_path(git_dir: &str) -> String {
+    // Use a hash of the git_dir for shorter filenames
+    let hash: u64 = git_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    format!("/tmp/cc-status-{:016x}.cache", hash)
+}
+
+/// Try to load cached git state via mmap
+fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
     if env::var("CC_STATUS_CACHE").is_err() {
         return None;
     }
-    let cache_path = format!("/tmp/cc-status-cache-{}.json", git_dir.replace('/', "_"));
-    let content = fs::read_to_string(&cache_path).ok()?;
-    serde_json::from_str(&content).ok()
+
+    let cache_path = get_cache_path(git_dir);
+    let file = OpenOptions::new().read(true).open(&cache_path).ok()?;
+
+    // Safety: we only read, and handle invalid data gracefully
+    let mmap = unsafe { MmapOptions::new().map(&file).ok()? };
+
+    MmapCache::from_bytes(&mmap)
 }
 
-/// Save git state to cache
-fn save_git_cache(git_dir: &str, cache: &GitCache) {
+/// Save git state to cache via mmap
+fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     if env::var("CC_STATUS_CACHE").is_err() {
         return;
     }
-    let cache_path = format!("/tmp/cc-status-cache-{}.json", git_dir.replace('/', "_"));
-    if let Ok(json) = serde_json::to_string(cache) {
-        let _ = fs::write(&cache_path, json);
+
+    let cache_path = get_cache_path(git_dir);
+
+    // Create or truncate file
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&cache_path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    // Set file size
+    if file.set_len(CACHE_SIZE as u64).is_err() {
+        return;
     }
+
+    // Map and write
+    // Safety: we control the file exclusively during write
+    let mut mmap = match unsafe { MmapMut::map_mut(&file) } {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    cache.to_bytes(&mut mmap);
+    let _ = mmap.flush();
 }
 
 fn main() {
@@ -388,15 +496,15 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
             }
         }
         GitMode::Full => {
-            // Try cache first
-            let cache = load_git_cache(&git.git_dir);
+            // Try mmap cache first
+            let cache = load_mmap_cache(&git.git_dir);
             let current_mtime = git.index_mtime();
             let current_oid = git.head_oid();
 
             let (files_changed, lines_added, lines_deleted, ahead, behind) =
                 if let Some(ref c) = cache {
-                    if c.index_mtime == current_mtime && c.head_oid == current_oid {
-                        // Cache hit
+                    if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
+                        // Cache hit - use mmap'd values directly
                         (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
                     } else {
                         // Cache miss - compute fresh
@@ -448,19 +556,19 @@ fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u3
     let ahead = ab.as_ref().map(|a| a.ahead).unwrap_or(0);
     let behind = ab.as_ref().map(|a| a.behind).unwrap_or(0);
 
-    // Save to cache
-    let cache = GitCache {
-        branch: git.branch.clone(),
-        worktree: git.worktree.clone(),
-        files_changed,
-        lines_added,
-        lines_deleted,
-        ahead,
-        behind,
-        index_mtime: mtime,
-        head_oid: oid.to_string(),
-    };
-    save_git_cache(&git.git_dir, &cache);
+    // Save to mmap cache
+    let mut cache = MmapCache::default();
+    cache.index_mtime = mtime;
+    // Copy OID bytes (null-padded)
+    let oid_bytes = oid.as_bytes();
+    let copy_len = oid_bytes.len().min(40);
+    cache.head_oid[..copy_len].copy_from_slice(&oid_bytes[..copy_len]);
+    cache.files_changed = files_changed;
+    cache.lines_added = lines_added;
+    cache.lines_deleted = lines_deleted;
+    cache.ahead = ahead;
+    cache.behind = behind;
+    save_mmap_cache(&git.git_dir, &cache);
 
     (files_changed, lines_added, lines_deleted, ahead, behind)
 }
