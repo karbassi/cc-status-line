@@ -142,35 +142,57 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
         return Cow::Borrowed(path);
     }
 
-    let segments: Vec<&str> = path.split('/').collect();
-    let count = segments.len();
+    // Find segment boundaries (positions after each '/')
+    let bytes = path.as_bytes();
+    let mut seg_starts: [usize; 32] = [0; 32]; // Stack-allocated, supports up to 32 segments
+    let mut seg_count = 1;
+    seg_starts[0] = 0;
 
-    if count < 2 {
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' && seg_count < 32 {
+            seg_starts[seg_count] = i + 1;
+            seg_count += 1;
+        }
+    }
+
+    if seg_count < 2 {
         return Cow::Borrowed(path);
     }
 
-    let mut result = String::with_capacity(max_width + 10);
-    for seg in &segments[..count.saturating_sub(2)] {
-        if let Some(c) = seg.chars().next() {
-            result.push(c);
-            result.push('/');
-        }
-    }
-    if count >= 2 {
-        result.push_str(segments[count - 2]);
-        result.push('/');
-    }
-    result.push_str(segments[count - 1]);
+    // Calculate lengths of last two segments
+    let last_start = seg_starts[seg_count - 1];
+    let parent_start = seg_starts[seg_count - 2];
+    let last_seg = &path[last_start..];
+    let parent_seg = &path[parent_start..last_start.saturating_sub(1)];
 
-    if result.len() > max_width && count > 2 {
-        result.clear();
-        for seg in &segments[..count - 1] {
-            if let Some(c) = seg.chars().next() {
-                result.push(c);
+    // Try keeping parent intact: a/b/.../parent/last
+    let abbrev_prefix_len = (seg_count - 2) * 2; // Each abbreviated segment = 1 char + '/'
+    let try1_len = abbrev_prefix_len + parent_seg.len() + 1 + last_seg.len();
+
+    let mut result = String::with_capacity(max_width + 10);
+
+    if try1_len <= max_width || seg_count <= 2 {
+        // Abbreviate all but last two segments
+        for i in 0..seg_count.saturating_sub(2) {
+            let start = seg_starts[i];
+            if start < bytes.len() && bytes[start] != b'/' {
+                result.push(bytes[start] as char);
                 result.push('/');
             }
         }
-        result.push_str(segments[count - 1]);
+        result.push_str(parent_seg);
+        result.push('/');
+        result.push_str(last_seg);
+    } else {
+        // Abbreviate all but last segment
+        for i in 0..seg_count - 1 {
+            let start = seg_starts[i];
+            if start < bytes.len() && bytes[start] != b'/' {
+                result.push(bytes[start] as char);
+                result.push('/');
+            }
+        }
+        result.push_str(last_seg);
     }
 
     Cow::Owned(result)
