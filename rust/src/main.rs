@@ -76,15 +76,58 @@ struct Workspace {
     current_dir: Option<String>,
 }
 
-#[derive(Default)]
-struct GitInfo {
-    branch: Option<String>,
-    worktree: Option<String>,
+struct DiffStats {
     files_changed: u32,
     lines_added: u32,
     lines_deleted: u32,
+}
+
+struct AheadBehind {
     ahead: u32,
     behind: u32,
+}
+
+/// Holds repository state for lazy evaluation of expensive git operations
+struct GitRepo {
+    repo: Repository,
+    branch: String,
+    worktree: Option<String>,
+}
+
+impl GitRepo {
+    /// Compute diff stats lazily - this is the expensive operation (~7-9ms)
+    fn diff_stats(&self) -> Option<DiffStats> {
+        let head = self.repo.head().ok()?;
+        let head_commit = head.peel_to_commit().ok()?;
+        let head_tree = head_commit.tree().ok()?;
+
+        let mut opts = DiffOptions::new();
+        opts.include_untracked(false);
+
+        let diff = self.repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts)).ok()?;
+        let stats = diff.stats().ok()?;
+
+        Some(DiffStats {
+            files_changed: stats.files_changed() as u32,
+            lines_added: stats.insertions() as u32,
+            lines_deleted: stats.deletions() as u32,
+        })
+    }
+
+    /// Compute ahead/behind lazily (~1-2ms)
+    fn ahead_behind(&self) -> Option<AheadBehind> {
+        let head = self.repo.head().ok()?;
+        let local_oid = head.target()?;
+        let branch = self.repo.find_branch(&self.branch, git2::BranchType::Local).ok()?;
+        let upstream = branch.upstream().ok()?;
+        let upstream_oid = upstream.get().target()?;
+        let (ahead, behind) = self.repo.graph_ahead_behind(local_oid, upstream_oid).ok()?;
+
+        Some(AheadBehind {
+            ahead: ahead as u32,
+            behind: behind as u32,
+        })
+    }
 }
 
 fn main() {
@@ -109,9 +152,9 @@ fn main() {
     // Row 1: Location
     write_row1(&mut out, &data, &current_dir, term_width);
 
-    // Row 2: Git
-    let git_info = get_git_info(&current_dir);
-    write_row2(&mut out, &git_info);
+    // Row 2: Git (lazy evaluation for expensive operations)
+    let git_repo = get_git_repo(&current_dir);
+    write_row2(&mut out, git_repo.as_ref());
 
     // Row 3: Claude info
     write_row3(&mut out, &data);
@@ -205,109 +248,77 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
-fn get_git_info(dir: &str) -> GitInfo {
-    let mut info = GitInfo::default();
+fn get_git_repo(dir: &str) -> Option<GitRepo> {
+    let repo = Repository::discover(dir).ok()?;
 
-    let repo = match Repository::discover(dir) {
-        Ok(r) => r,
-        Err(_) => return info,
+    // Extract branch name and worktree info, then drop the borrow
+    let (branch, worktree) = {
+        let head = repo.head().ok()?;
+        if !head.is_branch() {
+            return None;
+        }
+        let branch = head.shorthand()?.to_owned();
+        let worktree = if repo.is_worktree() {
+            repo.path().parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        (branch, worktree)
     };
 
-    // Get HEAD once and reuse
-    let head = match repo.head() {
-        Ok(h) => h,
-        Err(_) => return info,
-    };
-
-    // Get branch name
-    if !head.is_branch() {
-        return info;
-    }
-    let branch_name = match head.shorthand() {
-        Some(name) => name,
-        None => return info,
-    };
-    info.branch = Some(branch_name.to_owned());
-
-    // Check for worktree
-    if repo.is_worktree() {
-        if let Some(name) = repo.path().parent().and_then(|p| p.file_name()) {
-            info.worktree = Some(name.to_string_lossy().into_owned());
-        }
-    }
-
-    // Get diff stats (staged + unstaged vs HEAD)
-    if let Ok(head_commit) = head.peel_to_commit() {
-        if let Ok(head_tree) = head_commit.tree() {
-            let mut opts = DiffOptions::new();
-            opts.include_untracked(false);
-
-            if let Ok(diff) = repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts)) {
-                if let Ok(stats) = diff.stats() {
-                    info.files_changed = stats.files_changed() as u32;
-                    info.lines_added = stats.insertions() as u32;
-                    info.lines_deleted = stats.deletions() as u32;
-                }
-            }
-        }
-    }
-
-    // Get ahead/behind using cached head
-    if let Some(local_oid) = head.target() {
-        if let Ok(branch) = repo.find_branch(branch_name, git2::BranchType::Local) {
-            if let Ok(upstream) = branch.upstream() {
-                if let Some(upstream_oid) = upstream.get().target() {
-                    if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid) {
-                        info.ahead = ahead as u32;
-                        info.behind = behind as u32;
-                    }
-                }
-            }
-        }
-    }
-
-    info
+    Some(GitRepo { repo, branch, worktree })
 }
 
-fn write_row2<W: Write>(out: &mut W, git: &GitInfo) {
-    match &git.branch {
-        None => writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default(),
-        Some(branch) => {
-            write!(out, "{TN_PURPLE}{branch}{RESET}").unwrap_or_default();
+fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
+    let git = match git {
+        None => {
+            writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default();
+            return;
+        }
+        Some(g) => g,
+    };
 
-            if let Some(wt) = &git.worktree {
-                write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
+    write!(out, "{TN_PURPLE}{}{RESET}", git.branch).unwrap_or_default();
+
+    if let Some(wt) = &git.worktree {
+        write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
+    }
+
+    // Lazy: only compute diff stats now (expensive ~7-9ms)
+    if let Some(diff) = git.diff_stats() {
+        if diff.files_changed > 0 || diff.lines_added > 0 || diff.lines_deleted > 0 {
+            write!(out, "{SEP}").unwrap_or_default();
+            if diff.files_changed > 0 {
+                write!(out, "{TN_GRAY}{} files{RESET}", diff.files_changed).unwrap_or_default();
             }
-
-            if git.files_changed > 0 || git.lines_added > 0 || git.lines_deleted > 0 {
-                write!(out, "{SEP}").unwrap_or_default();
-                if git.files_changed > 0 {
-                    write!(out, "{TN_GRAY}{} files{RESET}", git.files_changed).unwrap_or_default();
-                }
-                if git.lines_added > 0 {
-                    if git.files_changed > 0 { write!(out, " ").unwrap_or_default(); }
-                    write!(out, "{TN_GREEN}+{}{RESET}", git.lines_added).unwrap_or_default();
-                }
-                if git.lines_deleted > 0 {
-                    if git.files_changed > 0 || git.lines_added > 0 { write!(out, " ").unwrap_or_default(); }
-                    write!(out, "{TN_RED}-{}{RESET}", git.lines_deleted).unwrap_or_default();
-                }
+            if diff.lines_added > 0 {
+                if diff.files_changed > 0 { write!(out, " ").unwrap_or_default(); }
+                write!(out, "{TN_GREEN}+{}{RESET}", diff.lines_added).unwrap_or_default();
             }
-
-            if git.ahead > 0 || git.behind > 0 {
-                write!(out, "{SEP}").unwrap_or_default();
-                if git.ahead > 0 {
-                    write!(out, "{TN_GRAY}↑{}{RESET}", git.ahead).unwrap_or_default();
-                }
-                if git.behind > 0 {
-                    if git.ahead > 0 { write!(out, " ").unwrap_or_default(); }
-                    write!(out, "{TN_GRAY}↓{}{RESET}", git.behind).unwrap_or_default();
-                }
+            if diff.lines_deleted > 0 {
+                if diff.files_changed > 0 || diff.lines_added > 0 { write!(out, " ").unwrap_or_default(); }
+                write!(out, "{TN_RED}-{}{RESET}", diff.lines_deleted).unwrap_or_default();
             }
-
-            writeln!(out).unwrap_or_default();
         }
     }
+
+    // Lazy: only compute ahead/behind now (~1-2ms)
+    if let Some(ab) = git.ahead_behind() {
+        if ab.ahead > 0 || ab.behind > 0 {
+            write!(out, "{SEP}").unwrap_or_default();
+            if ab.ahead > 0 {
+                write!(out, "{TN_GRAY}↑{}{RESET}", ab.ahead).unwrap_or_default();
+            }
+            if ab.behind > 0 {
+                if ab.ahead > 0 { write!(out, " ").unwrap_or_default(); }
+                write!(out, "{TN_GRAY}↓{}{RESET}", ab.behind).unwrap_or_default();
+            }
+        }
+    }
+
+    writeln!(out).unwrap_or_default();
 }
 
 fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
