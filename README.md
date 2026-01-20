@@ -2,6 +2,23 @@
 
 A lightweight, fast status line for Claude Code CLI.
 
+## Quick Start
+
+```bash
+# Install
+brew install karbassi/tap/cc-statusline
+
+# Configure Claude Code (~/.claude/settings.json)
+{
+  "statusLine": {
+    "type": "command",
+    "command": "cc-statusline"
+  }
+}
+```
+
+Restart Claude Code to see the new status line.
+
 ## Design
 
 4-row status line with Tokyo Night dim colors and dot (•) dividers.
