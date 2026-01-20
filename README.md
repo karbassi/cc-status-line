@@ -51,14 +51,14 @@ A lightweight, fast status line for Claude Code CLI.
 
 ## Performance
 
-Benchmarked with hyperfine (20 runs, same JSON input):
+Benchmarked with hyperfine (50 runs, same JSON input):
 
 | Version | Time | Speedup |
 |---------|------|---------|
-| Bash | 73 ms | baseline |
-| Rust | 6.6 ms | 11x faster |
+| Bash | 75 ms | baseline |
+| Rust | 4.4 ms | 17x faster |
 
-The Rust version uses libgit2 (statically linked) and mmap-based caching to avoid subprocess overhead. Caching is automatic and invalidates when git state changes.
+The Rust version uses gix (pure Rust git) and mmap-based caching. Caching is automatic and invalidates when git state changes.
 
 ## Development
 
