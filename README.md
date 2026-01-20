@@ -65,32 +65,15 @@ Optimizations:
 
 ## Installation
 
-### Download binary
-
-Download the latest release for your platform from [Releases](https://github.com/karbassi/cc-status-line/releases):
+### Homebrew
 
 ```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/karbassi/cc-status-line/releases/latest/download/cc-statusline-macos-arm64.tar.gz | tar xz
-mv cc-statusline ~/.local/bin/
-
-# macOS (Intel)
-curl -L https://github.com/karbassi/cc-status-line/releases/latest/download/cc-statusline-macos-x86_64.tar.gz | tar xz
-mv cc-statusline ~/.local/bin/
-
-# Linux (x86_64)
-curl -L https://github.com/karbassi/cc-status-line/releases/latest/download/cc-statusline-linux-x86_64.tar.gz | tar xz
-mv cc-statusline ~/.local/bin/
-
-# Linux (ARM64)
-curl -L https://github.com/karbassi/cc-status-line/releases/latest/download/cc-statusline-linux-arm64.tar.gz | tar xz
-mv cc-statusline ~/.local/bin/
+brew install karbassi/tap/cc-statusline
 ```
 
 ### Build from source
 
 ```bash
-cd rust
 cargo build --release
 cp target/release/cc-statusline ~/.local/bin/
 ```
