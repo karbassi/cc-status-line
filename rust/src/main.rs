@@ -389,14 +389,10 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     // Try cache first
     if let Some(cache) = get_cached_git_info(dir) {
         let repo = gix::open(&cache.git_path).ok()?;
-        let worktree = if repo.is_bare() { None } else {
-            repo.work_dir().and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-        };
         return Some(GitRepo {
             repo,
             branch: cache.branch,
-            worktree,
+            worktree: None, // TODO: detect linked worktrees
             git_dir: cache.git_path,
         });
     }
