@@ -241,9 +241,22 @@ if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
     fi
 fi
 
-ROW3="${TN_ORANGE}${MODEL}${RESET}${SEP}${TN_TEAL}${CONTEXT_PCT}%${RESET}${SEP}${TN_BLUE}${OUTPUT_MODE}${RESET}"
+# Build Row 3 with conditional segments
+ROW3=""
+if [[ -n "$MODEL" && "$MODEL" != "Unknown" ]]; then
+    ROW3="${TN_ORANGE}${MODEL}${RESET}"
+fi
+if [[ $CONTEXT_PCT -lt 100 ]]; then
+    [[ -n "$ROW3" ]] && ROW3+="$SEP"
+    ROW3+="${TN_TEAL}${CONTEXT_PCT}%${RESET}"
+fi
+if [[ -n "$OUTPUT_MODE" && "$OUTPUT_MODE" != "default" ]]; then
+    [[ -n "$ROW3" ]] && ROW3+="$SEP"
+    ROW3+="${TN_BLUE}${OUTPUT_MODE}${RESET}"
+fi
 if [[ -n "$BLOCK_TIMER" ]]; then
-    ROW3+="${SEP}${TN_YELLOW}◔ ${BLOCK_TIMER}${RESET}"
+    [[ -n "$ROW3" ]] && ROW3+="$SEP"
+    ROW3+="${TN_YELLOW}◔ ${BLOCK_TIMER}${RESET}"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -263,19 +276,24 @@ if [[ -n "$FIRST_EPOCH" ]]; then
     BLOCK_RESET="resets ${RESET_MINS}m"
 fi
 
-ROW4="${TN_GRAY}${DURATION_FMT}${RESET}"
-if [[ -n "$BLOCK_RESET" ]]; then
-    ROW4+="${SEP}${TN_GRAY}${BLOCK_RESET}${RESET}"
+# Build Row 4 with conditional segments
+ROW4=""
+if [[ $DURATION_MS -gt 0 ]]; then
+    ROW4="${TN_GRAY}${DURATION_FMT}${RESET}"
 fi
-ROW4+="${SEP}${TN_GRAY}${INPUT_FMT}/${OUTPUT_FMT}${RESET}"
+if [[ -n "$BLOCK_RESET" ]]; then
+    [[ -n "$ROW4" ]] && ROW4+="$SEP"
+    ROW4+="${TN_GRAY}${BLOCK_RESET}${RESET}"
+fi
+if [[ $INPUT_TOKENS -gt 0 || $OUTPUT_TOKENS -gt 0 ]]; then
+    [[ -n "$ROW4" ]] && ROW4+="$SEP"
+    ROW4+="${TN_GRAY}${INPUT_FMT}/${OUTPUT_FMT}${RESET}"
+fi
 
 # ═══════════════════════════════════════════════════════════════════
-# Output
+# Output - only show rows with content
 # ═══════════════════════════════════════════════════════════════════
 echo -e "$ROW1"
 echo -e "$ROW2"
-echo -e "$ROW3"
-# Only show Row 4 when there's actual session data
-if [[ $DURATION_MS -gt 0 || $INPUT_TOKENS -gt 0 || $OUTPUT_TOKENS -gt 0 ]]; then
-    echo -e "$ROW4"
-fi
+[[ -n "$ROW3" ]] && echo -e "$ROW3"
+[[ -n "$ROW4" ]] && echo -e "$ROW4"
