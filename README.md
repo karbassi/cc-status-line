@@ -56,8 +56,7 @@ Benchmarked with hyperfine (20 runs, same JSON input):
 | Version | Time | Speedup |
 |---------|------|---------|
 | Bash | 73 ms | baseline |
-| Rust | 14 ms | 5x faster |
-| Rust + cache | 6.6 ms | 11x faster |
+| Rust | 6.6 ms | 11x faster |
 
 The Rust version uses libgit2 (statically linked) and mmap-based caching to avoid subprocess overhead.
 
