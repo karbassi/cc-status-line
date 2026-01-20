@@ -22,6 +22,11 @@ TN_RED="\033[2;38;2;247;118;142m"      # deletions
 SEP="${TN_GRAY} • ${RESET}"
 
 # ═══════════════════════════════════════════════════════════════════
+# Terminal width detection
+# ═══════════════════════════════════════════════════════════════════
+TERM_WIDTH=$(tput cols 2>/dev/tty 2>/dev/null || stty size </dev/tty 2>/dev/null | cut -d' ' -f2 || echo 80)
+
+# ═══════════════════════════════════════════════════════════════════
 # Read JSON from stdin
 # ═══════════════════════════════════════════════════════════════════
 INPUT=$(cat)
@@ -70,21 +75,25 @@ format_duration() {
     fi
 }
 
-# Fish-style path abbreviation, keeping last 2 segments full
-# ~/Projects/personal/cc-status-line -> ~/P/personal/cc-status-line
+# Smart path abbreviation based on available width
+# Usage: abbreviate_path "path" max_width
+# - If path fits in max_width, show full path
+# - Otherwise, fish-style abbreviate until it fits (keeping last N segments full)
 abbreviate_path() {
     local path="$1"
-    local segments
-    IFS='/' read -ra segments <<< "$path"
-    local count=${#segments[@]}
+    local max_width="${2:-50}"
 
-    # If 3 or fewer segments, return as-is
-    if [[ $count -le 3 ]]; then
+    # If path fits, return as-is
+    if [[ ${#path} -le $max_width ]]; then
         echo "$path"
         return
     fi
 
-    # Abbreviate all but last 2 segments to first char
+    local segments
+    IFS='/' read -ra segments <<< "$path"
+    local count=${#segments[@]}
+
+    # Try keeping last 2 segments full, abbreviate rest
     local result=""
     for ((i=0; i<count-2; i++)); do
         local seg="${segments[$i]}"
@@ -92,8 +101,20 @@ abbreviate_path() {
             result+="${seg:0:1}/"
         fi
     done
-    # Add last 2 segments in full
     result+="${segments[$count-2]}/${segments[$count-1]}"
+
+    # If still too long, keep only last segment full
+    if [[ ${#result} -gt $max_width && $count -gt 2 ]]; then
+        result=""
+        for ((i=0; i<count-1; i++)); do
+            local seg="${segments[$i]}"
+            if [[ -n "$seg" ]]; then
+                result+="${seg:0:1}/"
+            fi
+        done
+        result+="${segments[$count-1]}"
+    fi
+
     echo "$result"
 }
 
@@ -114,7 +135,9 @@ else
     DISPLAY_CWD="."
 fi
 
-ABBREV_CWD=$(abbreviate_path "$DISPLAY_CWD")
+# Calculate available width for path (terminal width - project name - separator)
+PATH_WIDTH=$((TERM_WIDTH - ${#PROJECT_NAME} - 3))
+ABBREV_CWD=$(abbreviate_path "$DISPLAY_CWD" "$PATH_WIDTH")
 
 ROW1="${TN_BLUE}${PROJECT_NAME}${RESET}${SEP}${TN_CYAN}${ABBREV_CWD}${RESET}"
 
