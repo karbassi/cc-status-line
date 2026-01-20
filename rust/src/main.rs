@@ -28,6 +28,11 @@ const TN_GRAY: &str = "\x1b[2;38;2;86;95;137m";
 const TN_RED: &str = "\x1b[2;38;2;247;118;142m";
 
 const SEP: &str = "\x1b[2;38;2;86;95;137m • \x1b[0m";
+const TERM_WIDTH: usize = 50;
+
+fn hash_path(path: &str) -> u64 {
+    path.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+}
 
 #[derive(Deserialize, Default)]
 struct ClaudeInput {
@@ -244,9 +249,7 @@ impl GitRepo {
 }
 
 fn get_cache_path(git_dir: &str) -> String {
-    // Use a hash of the git_dir for shorter filenames
-    let hash: u64 = git_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    format!("/tmp/cc-status-{:016x}.cache", hash)
+    format!("/tmp/cc-status-{:016x}.cache", hash_path(git_dir))
 }
 
 /// Try to load cached git state via mmap
@@ -308,8 +311,7 @@ fn get_head_mtime(git_path: &str) -> u64 {
 
 /// Get cached git info for a working directory
 fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
-    let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
+    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash_path(working_dir));
 
     let content = fs::read_to_string(&cache_path).ok()?;
     let mut lines = content.lines();
@@ -335,8 +337,7 @@ fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
 
 /// Cache git info for a working directory
 fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
-    let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
+    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash_path(working_dir));
 
     let head_mtime = get_head_mtime(git_path);
     let content = format!("{}\n{}\n{}", git_path, branch, head_mtime);
@@ -365,8 +366,6 @@ fn main() {
 
     out.flush().unwrap_or_default();
 }
-
-const TERM_WIDTH: usize = 50;
 
 fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
     let project_name = data
@@ -451,17 +450,21 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+fn get_worktree_name(repo: &Repository) -> Option<String> {
+    if repo.is_worktree() {
+        repo.path().parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 fn get_git_repo(dir: &str) -> Option<GitRepo> {
     // Try full cache (git_path + branch) first
     if let Some(cache) = get_cached_git_info(dir) {
         let repo = Repository::open(&cache.git_path).ok()?;
-        let worktree = if repo.is_worktree() {
-            repo.path().parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-        } else {
-            None
-        };
+        let worktree = get_worktree_name(&repo);
         return Some(GitRepo {
             repo,
             branch: cache.branch,
@@ -474,21 +477,14 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     let repo = Repository::discover(dir).ok()?;
     let git_dir = repo.path().to_string_lossy().into_owned();
 
-    let (branch, worktree) = {
+    let branch = {
         let head = repo.head().ok()?;
         if !head.is_branch() {
             return None;
         }
-        let branch = head.shorthand()?.to_owned();
-        let worktree = if repo.is_worktree() {
-            repo.path().parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-        (branch, worktree)
+        head.shorthand()?.to_owned()
     };
+    let worktree = get_worktree_name(&repo);
 
     cache_git_info(dir, &git_dir, &branch);
     Some(GitRepo { repo, branch, worktree, git_dir })
