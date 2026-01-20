@@ -385,14 +385,28 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// Detect linked worktree name from git_dir path
+fn get_worktree_name(git_dir: &str) -> Option<String> {
+    // Linked worktrees have git_dir like: /path/.git/worktrees/<name>
+    if let Some(idx) = git_dir.find("/.git/worktrees/") {
+        let name = &git_dir[idx + 16..]; // skip "/.git/worktrees/"
+        let name = name.trim_end_matches('/');
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 fn get_git_repo(dir: &str) -> Option<GitRepo> {
     // Try cache first
     if let Some(cache) = get_cached_git_info(dir) {
         let repo = gix::open(&cache.git_path).ok()?;
+        let worktree = get_worktree_name(&cache.git_path);
         return Some(GitRepo {
             repo,
             branch: cache.branch,
-            worktree: None, // TODO: detect linked worktrees
+            worktree,
             git_dir: cache.git_path,
         });
     }
@@ -407,7 +421,7 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         .map(|n| n.shorten().to_string())
         .unwrap_or_else(|| "HEAD".to_string());
 
-    let worktree = None; // Simplified for now
+    let worktree = get_worktree_name(&git_dir);
 
     cache_git_info(dir, &git_dir, &branch);
     Some(GitRepo { repo, branch, worktree, git_dir })
