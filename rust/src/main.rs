@@ -345,61 +345,31 @@ fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
 }
 
 fn main() {
-    let profile = env::var("CC_STATUS_PROFILE").is_ok();
-    let t0 = std::time::Instant::now();
-
     let mut input = String::with_capacity(4096);
     io::stdin().read_to_string(&mut input).unwrap_or_default();
-    let t1 = t0.elapsed();
 
     let data: ClaudeInput = serde_json::from_str(&input).unwrap_or_default();
-    let t2 = t0.elapsed();
 
     let current_dir: Cow<str> = match data.workspace.current_dir.as_deref() {
         Some(dir) => Cow::Borrowed(dir),
         None => Cow::Owned(env::current_dir().unwrap().to_string_lossy().into_owned()),
     };
 
-    let term_width: usize = env::var("CC_STATUS_WIDTH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    // Row 1: Location
-    write_row1(&mut out, &data, &current_dir, term_width);
-    let t3 = t0.elapsed();
-
-    // Row 2: Git (lazy evaluation for expensive operations)
+    write_row1(&mut out, &data, &current_dir);
     let git_repo = get_git_repo(&current_dir);
-    let t4 = t0.elapsed();
     write_row2(&mut out, git_repo.as_ref());
-    let t5 = t0.elapsed();
-
-    // Row 3: Claude info
     write_row3(&mut out, &data);
-
-    // Row 4: Session
     write_row4(&mut out, &data);
 
     out.flush().unwrap_or_default();
-    let t6 = t0.elapsed();
-
-    if profile {
-        eprintln!("Profile:");
-        eprintln!("  stdin read:    {:>7.3}ms", t1.as_secs_f64() * 1000.0);
-        eprintln!("  json parse:    {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
-        eprintln!("  row1 (path):   {:>7.3}ms", (t3 - t2).as_secs_f64() * 1000.0);
-        eprintln!("  git discover:  {:>7.3}ms", (t4 - t3).as_secs_f64() * 1000.0);
-        eprintln!("  row2 (git):    {:>7.3}ms", (t5 - t4).as_secs_f64() * 1000.0);
-        eprintln!("  row3+4+flush:  {:>7.3}ms", (t6 - t5).as_secs_f64() * 1000.0);
-        eprintln!("  TOTAL:         {:>7.3}ms", t6.as_secs_f64() * 1000.0);
-    }
 }
 
-fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str, term_width: usize) {
+const TERM_WIDTH: usize = 50;
+
+fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
     let project_name = data
         .workspace
         .project_dir
@@ -415,7 +385,7 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str, term
         Cow::Borrowed(&current_dir)
     };
 
-    let path_width = term_width.saturating_sub(project_name.len()).saturating_sub(3).max(10);
+    let path_width = TERM_WIDTH.saturating_sub(project_name.len()).saturating_sub(3).max(10);
     let abbrev_cwd = abbreviate_path(&display_cwd, path_width);
 
     writeln!(out, "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}").unwrap_or_default();
@@ -483,16 +453,9 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
 }
 
 fn get_git_repo(dir: &str) -> Option<GitRepo> {
-    let profile = env::var("CC_STATUS_PROFILE").is_ok();
-    let t0 = std::time::Instant::now();
-
     // Try full cache (git_path + branch) first
     if let Some(cache) = get_cached_git_info(dir) {
-        let t1 = t0.elapsed();
         let repo = Repository::open(&cache.git_path).ok()?;
-        let t2 = t0.elapsed();
-
-        // Get worktree info (cheap, just path check)
         let worktree = if repo.is_worktree() {
             repo.path().parent()
                 .and_then(|p| p.file_name())
@@ -500,13 +463,6 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         } else {
             None
         };
-
-        if profile {
-            eprintln!("    cache hit:    {:>7.3}ms (lookup)", t1.as_secs_f64() * 1000.0);
-            eprintln!("    repo open:    {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
-            eprintln!("    head/branch:  {:>7.3}ms (SKIPPED - cached)", 0.0);
-        }
-
         return Some(GitRepo {
             repo,
             branch: cache.branch,
@@ -515,21 +471,10 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         });
     }
 
-    let t1 = t0.elapsed();
-
     // No cache or invalid - do full discovery
     let repo = Repository::discover(dir).ok()?;
-    let t2 = t0.elapsed();
     let git_dir = repo.path().to_string_lossy().into_owned();
 
-    if profile {
-        eprintln!("    cache miss:   {:>7.3}ms", t1.as_secs_f64() * 1000.0);
-        eprintln!("    discover:     {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
-    }
-
-    let t3 = t0.elapsed();
-
-    // Extract branch name and worktree info
     let (branch, worktree) = {
         let head = repo.head().ok()?;
         if !head.is_branch() {
@@ -546,14 +491,7 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         (branch, worktree)
     };
 
-    let t4 = t0.elapsed();
-    if profile {
-        eprintln!("    head/branch:  {:>7.3}ms", (t4 - t3).as_secs_f64() * 1000.0);
-    }
-
-    // Cache for next time
     cache_git_info(dir, &git_dir, &branch);
-
     Some(GitRepo { repo, branch, worktree, git_dir })
 }
 
