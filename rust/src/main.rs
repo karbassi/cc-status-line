@@ -256,8 +256,14 @@ impl GitRepo {
             .unwrap_or(0)
     }
 
-    /// Get HEAD oid for cache invalidation
+    /// Get HEAD oid for cache invalidation (reads file directly, avoids repo.head())
     fn head_oid(&self) -> String {
+        // Try to read HEAD oid directly from refs file (much faster than repo.head())
+        let ref_path = format!("{}refs/heads/{}", self.git_dir, self.branch);
+        if let Ok(oid) = fs::read_to_string(&ref_path) {
+            return oid.trim().to_string();
+        }
+        // Fallback to packed-refs or repo.head() if ref file doesn't exist
         self.repo.head()
             .ok()
             .and_then(|h| h.target())
@@ -323,8 +329,23 @@ fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     let _ = mmap.flush();
 }
 
-/// Get cached git directory path for a working directory
-fn get_cached_git_path(working_dir: &str) -> Option<String> {
+/// Cached git repo info (path + branch)
+struct GitPathCache {
+    git_path: String,
+    branch: String,
+    head_mtime: u64,
+}
+
+fn get_head_mtime(git_path: &str) -> u64 {
+    let head_path = format!("{}HEAD", git_path);
+    fs::metadata(&head_path)
+        .and_then(|m| m.modified())
+        .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs())
+        .unwrap_or(0)
+}
+
+/// Get cached git info for a working directory
+fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
     if env::var("CC_STATUS_CACHE").is_err() {
         return None;
     }
@@ -332,21 +353,30 @@ fn get_cached_git_path(working_dir: &str) -> Option<String> {
     let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
     let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
 
-    let git_path = fs::read_to_string(&cache_path).ok()?;
-    let git_path = git_path.trim();
+    let content = fs::read_to_string(&cache_path).ok()?;
+    let mut lines = content.lines();
 
-    // Verify the cached path still exists
-    if Path::new(git_path).exists() {
-        Some(git_path.to_string())
-    } else {
-        // Invalid cache, remove it
+    let git_path = lines.next()?.to_string();
+    let branch = lines.next()?.to_string();
+    let cached_mtime: u64 = lines.next()?.parse().ok()?;
+
+    // Verify git path exists
+    if !Path::new(&git_path).exists() {
         let _ = fs::remove_file(&cache_path);
-        None
+        return None;
     }
+
+    // Check if HEAD has changed (branch switch, commit, etc.)
+    let current_mtime = get_head_mtime(&git_path);
+    if current_mtime != cached_mtime {
+        return None; // Cache invalid, need to re-read branch
+    }
+
+    Some(GitPathCache { git_path, branch, head_mtime: cached_mtime })
 }
 
-/// Cache git directory path for a working directory
-fn cache_git_path(working_dir: &str, git_path: &str) {
+/// Cache git info for a working directory
+fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
     if env::var("CC_STATUS_CACHE").is_err() {
         return;
     }
@@ -354,7 +384,9 @@ fn cache_git_path(working_dir: &str, git_path: &str) {
     let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
     let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
 
-    let _ = fs::write(&cache_path, git_path);
+    let head_mtime = get_head_mtime(git_path);
+    let content = format!("{}\n{}\n{}", git_path, branch, head_mtime);
+    let _ = fs::write(&cache_path, content);
 }
 
 fn main() {
@@ -499,34 +531,50 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     let profile = env::var("CC_STATUS_PROFILE").is_ok();
     let t0 = std::time::Instant::now();
 
-    // Try cached git path first (avoids expensive discover walk)
-    let (repo, git_dir, cached) = if let Some(cached_path) = get_cached_git_path(dir) {
+    // Try full cache (git_path + branch) first
+    if let Some(cache) = get_cached_git_info(dir) {
         let t1 = t0.elapsed();
-        // Use Repository::open() directly - much faster than discover()
-        let repo = Repository::open(&cached_path).ok()?;
+        let repo = Repository::open(&cache.git_path).ok()?;
         let t2 = t0.elapsed();
+
+        // Get worktree info (cheap, just path check)
+        let worktree = if repo.is_worktree() {
+            repo.path().parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
         if profile {
-            eprintln!("    cache lookup: {:>7.3}ms", t1.as_secs_f64() * 1000.0);
+            eprintln!("    cache hit:    {:>7.3}ms (lookup)", t1.as_secs_f64() * 1000.0);
             eprintln!("    repo open:    {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
+            eprintln!("    head/branch:  {:>7.3}ms (SKIPPED - cached)", 0.0);
         }
-        (repo, cached_path, true)
-    } else {
-        let t1 = t0.elapsed();
-        // Fall back to discover() and cache the result
-        let repo = Repository::discover(dir).ok()?;
-        let t2 = t0.elapsed();
-        let git_dir = repo.path().to_string_lossy().into_owned();
-        cache_git_path(dir, &git_dir);
-        if profile {
-            eprintln!("    cache miss:   {:>7.3}ms", t1.as_secs_f64() * 1000.0);
-            eprintln!("    discover:     {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
-        }
-        (repo, git_dir, false)
-    };
+
+        return Some(GitRepo {
+            repo,
+            branch: cache.branch,
+            worktree,
+            git_dir: cache.git_path,
+        });
+    }
+
+    let t1 = t0.elapsed();
+
+    // No cache or invalid - do full discovery
+    let repo = Repository::discover(dir).ok()?;
+    let t2 = t0.elapsed();
+    let git_dir = repo.path().to_string_lossy().into_owned();
+
+    if profile {
+        eprintln!("    cache miss:   {:>7.3}ms", t1.as_secs_f64() * 1000.0);
+        eprintln!("    discover:     {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
+    }
 
     let t3 = t0.elapsed();
 
-    // Extract branch name and worktree info, then drop the borrow
+    // Extract branch name and worktree info
     let (branch, worktree) = {
         let head = repo.head().ok()?;
         if !head.is_branch() {
@@ -545,8 +593,11 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
 
     let t4 = t0.elapsed();
     if profile {
-        eprintln!("    head/branch:  {:>7.3}ms (cached={})", (t4 - t3).as_secs_f64() * 1000.0, cached);
+        eprintln!("    head/branch:  {:>7.3}ms", (t4 - t3).as_secs_f64() * 1000.0);
     }
+
+    // Cache for next time
+    cache_git_info(dir, &git_dir, &branch);
 
     Some(GitRepo { repo, branch, worktree, git_dir })
 }
