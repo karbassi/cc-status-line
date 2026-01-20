@@ -323,6 +323,40 @@ fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     let _ = mmap.flush();
 }
 
+/// Get cached git directory path for a working directory
+fn get_cached_git_path(working_dir: &str) -> Option<String> {
+    if env::var("CC_STATUS_CACHE").is_err() {
+        return None;
+    }
+
+    let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
+
+    let git_path = fs::read_to_string(&cache_path).ok()?;
+    let git_path = git_path.trim();
+
+    // Verify the cached path still exists
+    if Path::new(git_path).exists() {
+        Some(git_path.to_string())
+    } else {
+        // Invalid cache, remove it
+        let _ = fs::remove_file(&cache_path);
+        None
+    }
+}
+
+/// Cache git directory path for a working directory
+fn cache_git_path(working_dir: &str, git_path: &str) {
+    if env::var("CC_STATUS_CACHE").is_err() {
+        return;
+    }
+
+    let hash: u64 = working_dir.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash);
+
+    let _ = fs::write(&cache_path, git_path);
+}
+
 fn main() {
     let profile = env::var("CC_STATUS_PROFILE").is_ok();
     let t0 = std::time::Instant::now();
@@ -462,8 +496,35 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
 }
 
 fn get_git_repo(dir: &str) -> Option<GitRepo> {
-    let repo = Repository::discover(dir).ok()?;
-    let git_dir = repo.path().to_string_lossy().into_owned();
+    let profile = env::var("CC_STATUS_PROFILE").is_ok();
+    let t0 = std::time::Instant::now();
+
+    // Try cached git path first (avoids expensive discover walk)
+    let (repo, git_dir, cached) = if let Some(cached_path) = get_cached_git_path(dir) {
+        let t1 = t0.elapsed();
+        // Use Repository::open() directly - much faster than discover()
+        let repo = Repository::open(&cached_path).ok()?;
+        let t2 = t0.elapsed();
+        if profile {
+            eprintln!("    cache lookup: {:>7.3}ms", t1.as_secs_f64() * 1000.0);
+            eprintln!("    repo open:    {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
+        }
+        (repo, cached_path, true)
+    } else {
+        let t1 = t0.elapsed();
+        // Fall back to discover() and cache the result
+        let repo = Repository::discover(dir).ok()?;
+        let t2 = t0.elapsed();
+        let git_dir = repo.path().to_string_lossy().into_owned();
+        cache_git_path(dir, &git_dir);
+        if profile {
+            eprintln!("    cache miss:   {:>7.3}ms", t1.as_secs_f64() * 1000.0);
+            eprintln!("    discover:     {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
+        }
+        (repo, git_dir, false)
+    };
+
+    let t3 = t0.elapsed();
 
     // Extract branch name and worktree info, then drop the borrow
     let (branch, worktree) = {
@@ -481,6 +542,11 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         };
         (branch, worktree)
     };
+
+    let t4 = t0.elapsed();
+    if profile {
+        eprintln!("    head/branch:  {:>7.3}ms (cached={})", (t4 - t3).as_secs_f64() * 1000.0, cached);
+    }
 
     Some(GitRepo { repo, branch, worktree, git_dir })
 }
