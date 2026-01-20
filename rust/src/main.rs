@@ -324,10 +324,15 @@ fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
 }
 
 fn main() {
+    let profile = env::var("CC_STATUS_PROFILE").is_ok();
+    let t0 = std::time::Instant::now();
+
     let mut input = String::with_capacity(4096);
     io::stdin().read_to_string(&mut input).unwrap_or_default();
+    let t1 = t0.elapsed();
 
     let data: ClaudeInput = serde_json::from_str(&input).unwrap_or_default();
+    let t2 = t0.elapsed();
 
     let current_dir: Cow<str> = match data.workspace.current_dir.as_deref() {
         Some(dir) => Cow::Borrowed(dir),
@@ -344,10 +349,13 @@ fn main() {
 
     // Row 1: Location
     write_row1(&mut out, &data, &current_dir, term_width);
+    let t3 = t0.elapsed();
 
     // Row 2: Git (lazy evaluation for expensive operations)
     let git_repo = get_git_repo(&current_dir);
+    let t4 = t0.elapsed();
     write_row2(&mut out, git_repo.as_ref());
+    let t5 = t0.elapsed();
 
     // Row 3: Claude info
     write_row3(&mut out, &data);
@@ -356,6 +364,18 @@ fn main() {
     write_row4(&mut out, &data);
 
     out.flush().unwrap_or_default();
+    let t6 = t0.elapsed();
+
+    if profile {
+        eprintln!("Profile:");
+        eprintln!("  stdin read:    {:>7.3}ms", t1.as_secs_f64() * 1000.0);
+        eprintln!("  json parse:    {:>7.3}ms", (t2 - t1).as_secs_f64() * 1000.0);
+        eprintln!("  row1 (path):   {:>7.3}ms", (t3 - t2).as_secs_f64() * 1000.0);
+        eprintln!("  git discover:  {:>7.3}ms", (t4 - t3).as_secs_f64() * 1000.0);
+        eprintln!("  row2 (git):    {:>7.3}ms", (t5 - t4).as_secs_f64() * 1000.0);
+        eprintln!("  row3+4+flush:  {:>7.3}ms", (t6 - t5).as_secs_f64() * 1000.0);
+        eprintln!("  TOTAL:         {:>7.3}ms", t6.as_secs_f64() * 1000.0);
+    }
 }
 
 fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str, term_width: usize) {
