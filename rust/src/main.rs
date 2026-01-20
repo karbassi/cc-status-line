@@ -90,7 +90,6 @@ struct AheadBehind {
     behind: u32,
 }
 
-
 /// Binary cache format for mmap (fixed 128 bytes)
 /// Layout:
 ///   0-3:   magic "CCST"
