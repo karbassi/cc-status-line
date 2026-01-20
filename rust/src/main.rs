@@ -4,6 +4,13 @@ use std::borrow::Cow;
 use std::env;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::OnceLock;
+
+static HOME_DIR: OnceLock<String> = OnceLock::new();
+
+fn get_home() -> &'static str {
+    HOME_DIR.get_or_init(|| env::var("HOME").unwrap_or_default())
+}
 
 // Tokyo Night Dim Colors
 const RESET: &str = "\x1b[0m";
@@ -124,8 +131,8 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str, term
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
 
-    let home = env::var("HOME").unwrap_or_default();
-    let display_cwd: Cow<str> = if !home.is_empty() && current_dir.starts_with(&home) {
+    let home = get_home();
+    let display_cwd: Cow<str> = if !home.is_empty() && current_dir.starts_with(home) {
         Cow::Owned(format!("~{}", &current_dir[home.len()..]))
     } else {
         Cow::Borrowed(&current_dir)
