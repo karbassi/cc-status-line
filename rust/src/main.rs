@@ -355,7 +355,11 @@ fn write_row4<W: Write>(out: &mut W, data: &ClaudeInput) {
     let output_tokens = data.context_window.total_output_tokens.unwrap_or(0);
     if input_tokens > 0 || output_tokens > 0 {
         if has_content { write!(out, "{SEP}").unwrap_or_default(); }
-        write!(out, "{TN_GRAY}{}/{}{RESET}", format_tokens(input_tokens), format_tokens(output_tokens)).unwrap_or_default();
+        write!(out, "{TN_GRAY}").unwrap_or_default();
+        write_tokens(out, input_tokens);
+        write!(out, "/").unwrap_or_default();
+        write_tokens(out, output_tokens);
+        write!(out, "{RESET}").unwrap_or_default();
         has_content = true;
     }
 
@@ -364,12 +368,16 @@ fn write_row4<W: Write>(out: &mut W, data: &ClaudeInput) {
     }
 }
 
-fn format_tokens(n: u64) -> String {
+fn write_tokens<W: Write>(out: &mut W, n: u64) {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        // Use integer math: n / 100_000 gives us tenths of millions
+        let tenths = n / 100_000;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        let _ = write!(out, "{}.{}M", whole, frac);
     } else if n >= 1_000 {
-        format!("{}K", n / 1_000)
+        let _ = write!(out, "{}K", n / 1_000);
     } else {
-        n.to_string()
+        let _ = write!(out, "{}", n);
     }
 }
