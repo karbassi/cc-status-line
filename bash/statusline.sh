@@ -30,7 +30,7 @@ INPUT=$(cat)
 # Extract Claude data
 # ═══════════════════════════════════════════════════════════════════
 MODEL=$(echo "$INPUT" | jq -r '.model.display_name // "Unknown"')
-CONTEXT_PCT=$(echo "$INPUT" | jq -r '.context_window.used_percentage // 0' | xargs printf "%.0f")
+CONTEXT_PCT=$(echo "$INPUT" | jq -r '.context_window.remaining_percentage // 100' | xargs printf "%.0f")
 INPUT_TOKENS=$(echo "$INPUT" | jq -r '.context_window.total_input_tokens // 0')
 OUTPUT_TOKENS=$(echo "$INPUT" | jq -r '.context_window.total_output_tokens // 0')
 DURATION_MS=$(echo "$INPUT" | jq -r '.cost.total_duration_ms // 0')
