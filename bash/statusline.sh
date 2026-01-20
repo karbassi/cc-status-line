@@ -200,11 +200,13 @@ fi
 
 # Block timer - time elapsed in current 5-hour block
 BLOCK_TIMER=""
+FIRST_TS=""
+FIRST_EPOCH=""
 if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
-    # Get first timestamp from transcript
-    FIRST_TS=$(head -1 "$TRANSCRIPT_PATH" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null || echo "")
+    # Get first timestamp from transcript (grep for first line with timestamp, faster than parsing entire file)
+    FIRST_TS=$(grep -m1 '"timestamp"' "$TRANSCRIPT_PATH" 2>/dev/null | jq -r '.timestamp' 2>/dev/null || echo "")
     if [[ -n "$FIRST_TS" ]]; then
-        # Parse ISO timestamp and calculate elapsed
+        # Parse ISO timestamp (format: 2026-01-20T03:13:42.539Z)
         FIRST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${FIRST_TS%%.*}" "+%s" 2>/dev/null || echo "")
         if [[ -n "$FIRST_EPOCH" ]]; then
             NOW_EPOCH=$(date "+%s")
@@ -228,20 +230,14 @@ DURATION_FMT=$(format_duration "$DURATION_MS")
 INPUT_FMT=$(format_tokens "$INPUT_TOKENS")
 OUTPUT_FMT=$(format_tokens "$OUTPUT_TOKENS")
 
-# Block reset countdown (time until 5h block resets)
+# Block reset countdown (time until 5h block resets) - reuses FIRST_EPOCH from above
 BLOCK_RESET=""
-if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
-    FIRST_TS=$(head -1 "$TRANSCRIPT_PATH" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null || echo "")
-    if [[ -n "$FIRST_TS" ]]; then
-        FIRST_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${FIRST_TS%%.*}" "+%s" 2>/dev/null || echo "")
-        if [[ -n "$FIRST_EPOCH" ]]; then
-            NOW_EPOCH=$(date "+%s")
-            ELAPSED_SECS=$((NOW_EPOCH - FIRST_EPOCH))
-            BLOCK_REMAINING=$((5 * 3600 - (ELAPSED_SECS % (5 * 3600))))
-            RESET_MINS=$((BLOCK_REMAINING / 60))
-            BLOCK_RESET="resets ${RESET_MINS}m"
-        fi
-    fi
+if [[ -n "$FIRST_EPOCH" ]]; then
+    NOW_EPOCH=$(date "+%s")
+    ELAPSED_SECS=$((NOW_EPOCH - FIRST_EPOCH))
+    BLOCK_REMAINING=$((5 * 3600 - (ELAPSED_SECS % (5 * 3600))))
+    RESET_MINS=$((BLOCK_REMAINING / 60))
+    BLOCK_RESET="resets ${RESET_MINS}m"
 fi
 
 ROW4="${TN_GRAY}${DURATION_FMT}${RESET}"
