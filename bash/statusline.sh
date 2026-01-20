@@ -151,7 +151,7 @@ GIT_WORKTREE=""
 if [[ -n "$GIT_BRANCH" ]]; then
     GIT_DIR=$(git -C "$CURRENT_DIR" rev-parse --git-dir 2>/dev/null || echo "")
     if [[ "$GIT_DIR" == *".git/worktrees/"* ]]; then
-        GIT_WORKTREE=$(basename "$(dirname "$GIT_DIR")")
+        GIT_WORKTREE=$(basename "$GIT_DIR")
     fi
 fi
 
