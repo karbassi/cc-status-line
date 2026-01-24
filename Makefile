@@ -20,6 +20,18 @@ screenshots: release
 	@echo "=== Git: branch + changed files ==="
 	@echo '{"workspace":{"project_dir":"/app"},"git":{"branch":"feat/login","changed_files":3}}' | ./target/release/cc-statusline
 	@echo
+	@echo "=== Git: local only (no remote) ==="
+	@echo '{"workspace":{"project_dir":"/app"},"git":{"branch":"local-experiment","changed_files":1}}' | ./target/release/cc-statusline
+	@echo
+	@echo "=== Git: with remote (ahead/behind) ==="
+	@echo '{"workspace":{"project_dir":"/app"},"git":{"branch":"main","changed_files":2,"ahead":3,"behind":1}}' | ./target/release/cc-statusline
+	@echo
+	@echo "=== Git: ahead only ==="
+	@echo '{"workspace":{"project_dir":"/app"},"git":{"branch":"feat/push-me","ahead":5}}' | ./target/release/cc-statusline
+	@echo
+	@echo "=== Git: behind only ==="
+	@echo '{"workspace":{"project_dir":"/app"},"git":{"branch":"main","behind":12}}' | ./target/release/cc-statusline
+	@echo
 	@echo "=== PR: open + checks passed ==="
 	@echo '{"workspace":{"project_dir":"/app"},"git":{"branch":"feat/login","changed_files":2},"pr":{"number":42,"state":"open","changed_files":5,"check_status":"passed"}}' | ./target/release/cc-statusline
 	@echo

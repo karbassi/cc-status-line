@@ -94,6 +94,10 @@ struct GitInput {
     branch: Option<String>,
     #[serde(default)]
     changed_files: Option<u32>,
+    #[serde(default)]
+    ahead: Option<u32>,
+    #[serde(default)]
+    behind: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -485,8 +489,15 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>, git_input: &GitInput
 
     // Get file stats: prefer JSON input, fallback to cache/detection
     let (files_changed, lines_added, lines_deleted, ahead, behind) =
-        if let Some(files) = git_input.changed_files {
-            (files, 0, 0, 0, 0)
+        if git_input.changed_files.is_some() || git_input.ahead.is_some() || git_input.behind.is_some() {
+            // Use JSON input values
+            (
+                git_input.changed_files.unwrap_or(0),
+                0,
+                0,
+                git_input.ahead.unwrap_or(0),
+                git_input.behind.unwrap_or(0),
+            )
         } else if let Some(g) = git {
             let cache = load_mmap_cache(&g.git_dir);
             let current_mtime = g.index_mtime();
