@@ -282,20 +282,15 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
 // ============================================================================
 
 /// Check if remote is GitHub
-/// Resolves the common git directory for worktree support
+/// Uses gix common_dir() for worktree support
 fn is_github_remote(git_dir: &str) -> bool {
-    // In linked worktrees, git_dir is .git/worktrees/<name>, not the main .git dir.
-    // The config with remotes lives in the common dir, so resolve it first.
-    let common_dir = Command::new("git")
-        .args(["--git-dir", git_dir, "rev-parse", "--git-common-dir"])
-        .output()
+    // Use gix to get the common dir (handles worktrees automatically)
+    let common_dir = gix::open(git_dir)
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| git_dir.trim_end_matches('/').to_string());
+        .map(|repo| repo.common_dir().to_path_buf())
+        .unwrap_or_else(|| Path::new(git_dir).to_path_buf());
 
-    let config_path = Path::new(&common_dir).join("config");
+    let config_path = common_dir.join("config");
     if let Ok(content) = fs::read_to_string(&config_path) {
         return content.contains("github.com");
     }
@@ -815,10 +810,73 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     writeln!(out).unwrap_or_default();
 }
 
+/// Get ahead/behind counts relative to upstream using gix
+fn get_ahead_behind(repo: &gix::Repository, branch: &str) -> (u32, u32) {
+    // Get HEAD commit
+    let head_id = match repo.head_id() {
+        Ok(id) => id,
+        Err(_) => return (0, 0),
+    };
+
+    // Try to find upstream tracking branch
+    let upstream_ref = format!("refs/remotes/origin/{}", branch);
+    let upstream_id = match repo.find_reference(&upstream_ref) {
+        Ok(r) => match r.into_fully_peeled_id() {
+            Ok(id) => id,
+            Err(_) => return (0, 0),
+        },
+        Err(_) => return (0, 0), // No upstream
+    };
+
+    // If same commit, no ahead/behind
+    if head_id == upstream_id {
+        return (0, 0);
+    }
+
+    // Count commits reachable from HEAD but not upstream (ahead)
+    let ahead = count_commits_not_in(repo, head_id.detach(), upstream_id.detach());
+    // Count commits reachable from upstream but not HEAD (behind)
+    let behind = count_commits_not_in(repo, upstream_id.detach(), head_id.detach());
+
+    (ahead, behind)
+}
+
+/// Count commits reachable from `from` but not from `exclude`
+fn count_commits_not_in(repo: &gix::Repository, from: gix::ObjectId, exclude: gix::ObjectId) -> u32 {
+    // First, collect all commits reachable from exclude (the "stop" set)
+    let mut exclude_set = std::collections::HashSet::new();
+    let Ok(exclude_iter) = repo.rev_walk([exclude]).all() else {
+        return 0;
+    };
+    for info in exclude_iter {
+        let Ok(info) = info else { break };
+        exclude_set.insert(info.id);
+        if exclude_set.len() > 10000 {
+            break; // Safety limit
+        }
+    }
+
+    // Now count commits from `from` that aren't in exclude_set
+    let Ok(from_iter) = repo.rev_walk([from]).all() else {
+        return 0;
+    };
+    let mut count = 0u32;
+    for info in from_iter {
+        let Ok(info) = info else { break };
+        if exclude_set.contains(&info.id) {
+            break; // Hit common ancestor
+        }
+        count += 1;
+        if count > 999 {
+            break; // Safety limit
+        }
+    }
+    count
+}
+
 fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32, u32, u32) {
     let (files_changed, lines_added, lines_deleted) = git.diff_stats().unwrap_or((0, 0, 0));
-    let ahead = 0u32; // Simplified - gix ahead/behind is complex
-    let behind = 0u32;
+    let (ahead, behind) = get_ahead_behind(&git.repo, &git.branch);
 
     let mut cache = MmapCache::default();
     cache.index_mtime = mtime;
