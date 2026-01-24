@@ -19,52 +19,56 @@ brew install karbassi/tap/cc-statusline
 
 Restart Claude Code to see the new status line.
 
-## Design
-
-4-row status line with Tokyo Night dim colors and dot (•) dividers.
-
-```
- trips • d/api/endpoints
- main • feature-auth • +3 ~2 • ↑1
- Opus • 84% • verbose • ◔ 35m
- 47m • resets 12m • 125K/42K
-```
+## Features
 
 ### Row 1: Location
-- Project name (basename of where Claude launched)
-- CWD relative to project (fish-style abbreviated if >20 chars OR >3 segments)
+- **Project name** - basename of where Claude launched
+- **Current directory** - fish-style abbreviated path (e.g., `~/p/weather-app/s/components`)
 
 ### Row 2: Git
-- Branch name
-- Worktree name (if active)
-- Status: `+N` added, `~N` modified, `-N` deleted, `?N` untracked
-- Remote: `↑N` ahead, `↓N` behind
+- **Branch name** - current git branch
+- **Worktree name** - if using git worktrees
+- **Changed files** - number of modified files
+- **Remote tracking** - `↑N` commits ahead, `↓N` commits behind
 
-### Row 3: Claude
-- Model (Opus/Sonnet/Haiku)
-- Context % remaining
-- Output mode
-- Block timer
+### Row 3: Pull Request (optional)
+- **PR number** - with state color (green=open, purple=merged, red=closed)
+- **Changed files** - files changed in PR
+- **Check status** - checks passed/failed/pending
 
-### Row 4: Session
-- Session duration
-- Block reset countdown
-- Tokens (in/out)
+### Row 4: Claude
+- **Model** - Opus 4.5, Sonnet 4, Haiku
+- **Context %** - remaining context window
+- **Output mode** - verbose, concise, etc.
+
+### Row 5: Session
+- **Duration** - total session time
+- **Tokens** - input/output token counts
+
+## Example Output
+
+```
+weather-app • ~/projects/weather-app
+feat/hourly-forecast • 3 files
+#42 • 5 files • checks passed
+Opus 4.5 • 47%
+31m • 150K/45K
+```
 
 ## Style
 
 - **Theme**: Tokyo Night (dim)
 - **Dividers**: Dot (•)
-- **Colors by segment**:
-  - Blue `#7aa2f7` - project
-  - Cyan `#7dcfff` - cwd
+- **Colors**:
+  - Blue `#7aa2f7` - project name
+  - Cyan `#7dcfff` - current directory
   - Purple `#bb9af7` - git branch
   - Magenta `#9d7cd8` - worktree
-  - Green `#9ece6a` - additions/clean
-  - Yellow `#e0af68` - modifications/timers
-  - Orange `#ff9e64` - model
+  - Green `#9ece6a` - PR open, checks passed
+  - Orange `#ff9e64` - model, checks pending
+  - Red `#f7768e` - PR closed, checks failed
   - Teal `#2ac3de` - context %
-  - Gray `#565f89` - muted/session
+  - Gray `#565f89` - muted text, session info
 
 ## Performance
 

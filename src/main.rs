@@ -93,6 +93,8 @@ struct GitInput {
     #[serde(default)]
     branch: Option<String>,
     #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default)]
     changed_files: Option<u32>,
     #[serde(default)]
     ahead: Option<u32>,
@@ -480,11 +482,11 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>, git_input: &GitInput
 
     write!(out, "{TN_PURPLE}{branch}{RESET}").unwrap_or_default();
 
-    // Worktree only from filesystem detection
-    if let Some(g) = git {
-        if let Some(wt) = &g.worktree {
-            write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
-        }
+    // Worktree: prefer JSON input, fallback to filesystem detection
+    let worktree = git_input.worktree.as_deref()
+        .or_else(|| git.and_then(|g| g.worktree.as_deref()));
+    if let Some(wt) = worktree {
+        write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
     }
 
     // Get file stats: prefer JSON input, fallback to cache/detection
@@ -586,13 +588,13 @@ fn write_pr_rows<W: Write>(out: &mut W, pr_input: &PrInput) {
     }
 
     if let Some(check_status) = &pr_input.check_status {
-        let (check_color, check_icon) = match check_status.as_str() {
-            "passed" => (TN_GREEN, "✓"),
-            "failed" => (TN_RED, "✗"),
-            "pending" => (TN_ORANGE, "●"),
-            _ => (TN_GRAY, "?"),
+        let (check_color, check_text) = match check_status.as_str() {
+            "passed" => (TN_GREEN, "checks passed"),
+            "failed" => (TN_RED, "checks failed"),
+            "pending" => (TN_ORANGE, "checks pending"),
+            _ => (TN_GRAY, "checks unknown"),
         };
-        write!(out, "{SEP}{check_color}{check_icon}{RESET}").unwrap_or_default();
+        write!(out, "{SEP}{check_color}{check_text}{RESET}").unwrap_or_default();
     }
 
     writeln!(out).unwrap_or_default();
