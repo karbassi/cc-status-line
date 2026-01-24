@@ -232,19 +232,27 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
         None => String::new(),
         Some(checks) if checks.is_empty() => String::new(),
         Some(checks) => {
+            // Treat any non-success conclusion as a failure
             let has_failure = checks.iter().any(|c| {
-                matches!(c.conclusion.as_deref(), Some("FAILURE") | Some("CANCELLED"))
+                match c.conclusion.as_deref() {
+                    Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL") => false,
+                    Some(_) => true, // FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, etc.
+                    None => false,
+                }
             });
-            let all_done = checks.iter().all(|c| c.conclusion.is_some());
+            let has_pending = checks.iter().any(|c| c.conclusion.is_none());
             let all_passed = checks.iter().all(|c| {
-                matches!(c.conclusion.as_deref(), Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL"))
+                matches!(
+                    c.conclusion.as_deref(),
+                    Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
+                )
             });
 
             if has_failure {
                 "failed".to_string()
             } else if all_passed {
                 "passed".to_string()
-            } else if !all_done {
+            } else if has_pending {
                 "pending".to_string()
             } else {
                 String::new()
