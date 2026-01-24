@@ -796,7 +796,16 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     }
 
     // Check status (only show if we have a valid status)
+    // Link to checks page: {pr_url}/checks
+    let checks_url = if !pr.url.is_empty() {
+        format!("{}/checks", pr.url)
+    } else {
+        String::new()
+    };
     match pr.check_status.trim() {
+        "passed" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_GREEN}checks passed{RESET}{OSC8_END}").unwrap_or_default(),
+        "failed" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_RED}checks failed{RESET}{OSC8_END}").unwrap_or_default(),
+        "pending" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_ORANGE}checks pending{RESET}{OSC8_END}").unwrap_or_default(),
         "passed" => write!(out, "{SEP}{TN_GREEN}checks passed{RESET}").unwrap_or_default(),
         "failed" => write!(out, "{SEP}{TN_RED}checks failed{RESET}").unwrap_or_default(),
         "pending" => write!(out, "{SEP}{TN_ORANGE}checks pending{RESET}").unwrap_or_default(),
