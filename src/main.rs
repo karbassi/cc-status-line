@@ -193,10 +193,17 @@ struct GhCheckRun {
 }
 
 const PR_CACHE_TTL: u64 = 60; // seconds
+const PR_NEGATIVE_CACHE_TTL: u64 = 300; // 5 minutes for "no PR" cache
+const PR_REFRESH_THROTTLE: u64 = 30; // minimum seconds between refresh attempts
 
 fn get_pr_cache_path(repo_path: &str, branch: &str) -> String {
     let key = format!("{}:{}", repo_path, branch);
     format!("/tmp/cc-pr-{:016x}.cache", hash_path(&key))
+}
+
+fn get_pr_attempt_path(repo_path: &str, branch: &str) -> String {
+    let key = format!("{}:{}", repo_path, branch);
+    format!("/tmp/cc-pr-attempt-{:016x}", hash_path(&key))
 }
 
 fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
@@ -311,10 +318,14 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
 
     // Write a temp script with properly escaped values to avoid injection
     // The script file itself contains the literal values, not shell-interpolated
+    // Write NO_PR marker if gh returns empty (negative cache)
     let script_path = format!("/tmp/cc-pr-refresh-{}.sh", std::process::id());
     let script = format!(
-        "#!/bin/sh\ncd {} && json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null) && [ -n \"$json\" ] && printf '%s\\n%s\\n%s' {} {} \"$json\" > {} ; rm -f {}\n",
+        "#!/bin/sh\ncd {} && json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null); if [ -n \"$json\" ]; then printf '%s\\n%s\\n%s' {} {} \"$json\" > {}; else printf '%s\\n%s\\nNO_PR' {} {} > {}; fi; rm -f {}\n",
         shell_escape(work_dir),
+        now,
+        shell_escape(branch),
+        shell_escape(&cache_path),
         now,
         shell_escape(branch),
         shell_escape(&cache_path),
@@ -338,6 +349,27 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Check if we should skip refresh (throttled or negative cache)
+fn should_skip_refresh(git_dir: &str, branch: &str) -> bool {
+    let attempt_path = get_pr_attempt_path(git_dir, branch);
+    if let Ok(metadata) = fs::metadata(&attempt_path) {
+        if let Ok(mtime) = metadata.modified() {
+            let now = SystemTime::now();
+            if let Ok(elapsed) = now.duration_since(mtime) {
+                // Skip if we attempted recently
+                return elapsed.as_secs() < PR_REFRESH_THROTTLE;
+            }
+        }
+    }
+    false
+}
+
+/// Mark that we've attempted a refresh
+fn mark_refresh_attempt(git_dir: &str, branch: &str) {
+    let attempt_path = get_pr_attempt_path(git_dir, branch);
+    let _ = fs::write(&attempt_path, "");
+}
+
 /// Get PR data - checks cache first, spawns refresh if needed
 /// Returns immediately with cached data or None (never blocks on network)
 fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
@@ -345,6 +377,33 @@ fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
     if let Some(cache) = load_pr_cache(&git.git_dir, &git.branch) {
         return Some(cache);
     }
+
+    // Check negative cache (NO_PR marker) - uses longer TTL
+    let cache_path = get_pr_cache_path(&git.git_dir, &git.branch);
+    if let Ok(content) = fs::read_to_string(&cache_path) {
+        if let Some(first_line) = content.lines().next() {
+            if let Ok(timestamp) = first_line.parse::<u64>() {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // If cache file exists and is recent, check for NO_PR marker
+                if now.saturating_sub(timestamp) < PR_NEGATIVE_CACHE_TTL {
+                    if content.contains("\nNO_PR") {
+                        return None; // Negative cache hit - no PR exists
+                    }
+                }
+            }
+        }
+    }
+
+    // Throttle refresh attempts to avoid process storms
+    if should_skip_refresh(&git.git_dir, &git.branch) {
+        return None;
+    }
+
+    // Mark that we're attempting a refresh
+    mark_refresh_attempt(&git.git_dir, &git.branch);
 
     // Cache miss or stale - spawn background refresh only
     // Don't block - return None and let the next render show PR data
