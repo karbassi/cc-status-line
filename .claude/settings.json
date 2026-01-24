@@ -1,31 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git config:*)",
-      "Bash(git push:*)",
-      "WebFetch(domain:github.com)",
-      "Bash(gh run list:*)",
-      "Bash(gh run view:*)",
-      "Bash(git tag:*)",
-      "Bash(gh repo view:*)",
-      "Bash(gh release view:*)",
-      "Bash(gh repo create:*)",
-      "Bash(shasum:*)",
-      "Bash(curl:*)",
-      "Bash(gh repo edit:*)",
-      "Bash(tar:*)",
-      "Bash(gh release download:*)",
-      "Bash(git branch:*)",
-      "Bash(git rm:*)",
-      "Bash(/Users/ali.karbassi/Projects/personal/cc-status-line/target/release/cc-statusline:*)",
-      "Bash(echo:*)",
-      "Bash(/tmp/v0.1.1-assets/cc-statusline-macos-arm64/cc-statusline:*)",
-      "Bash(/tmp/cc-statusline)",
-      "Bash(brew install:*)",
-      "Bash(brew reinstall:*)",
-      "Bash(cc-statusline)",
-      "Bash(git log:*)",
       "Bash(cargo:*)",
+      "Bash(cc-statusline:*)",
       "Bash(hyperfine:*)"
     ]
   },
