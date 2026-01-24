@@ -27,7 +27,11 @@ fn get_cache_dir() -> &'static PathBuf {
                 let home = get_home();
                 if home.is_empty() {
                     // Fallback to /tmp with user-specific subdirectory
-                    PathBuf::from(format!("/tmp/cc-statusline-{}", unsafe { libc::getuid() }))
+                    #[cfg(unix)]
+                    let uid = unsafe { libc::getuid() };
+                    #[cfg(not(unix))]
+                    let uid = std::process::id();
+                    PathBuf::from(format!("/tmp/cc-statusline-{}", uid))
                 } else {
                     PathBuf::from(home).join(".cache")
                 }
@@ -224,6 +228,13 @@ const PR_CACHE_TTL: u64 = 60; // seconds
 const PR_NEGATIVE_CACHE_TTL: u64 = 300; // 5 minutes for "no PR" cache
 const PR_REFRESH_THROTTLE: u64 = 30; // minimum seconds between refresh attempts
 
+/// Result of loading PR cache - handles all states in one read
+enum PrCacheResult {
+    Hit(PrCacheData),  // Valid PR data
+    NoPr,              // Negative cache: no PR exists for this branch
+    Stale,             // Cache is stale or error occurred, needs refresh
+}
+
 fn get_pr_cache_path(repo_path: &str, branch: &str) -> PathBuf {
     let key = format!("{}:{}", repo_path, branch);
     get_cache_dir().join(format!("pr-{:016x}.cache", hash_path(&key)))
@@ -234,39 +245,64 @@ fn get_pr_attempt_path(repo_path: &str, branch: &str) -> PathBuf {
     get_cache_dir().join(format!("pr-attempt-{:016x}", hash_path(&key)))
 }
 
-fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
+/// Load PR cache - reads file once and handles all states
+fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
     let cache_path = get_pr_cache_path(repo_path, branch);
-    let content = fs::read_to_string(&cache_path).ok()?;
+    let content = match fs::read_to_string(&cache_path) {
+        Ok(c) => c,
+        Err(_) => return PrCacheResult::Stale,
+    };
 
     // First line is timestamp, rest is JSON
     let mut lines = content.lines();
-    let timestamp: u64 = lines.next()?.parse().ok()?;
-    let cached_branch = lines.next()?;
+    let timestamp: u64 = match lines.next().and_then(|s| s.parse().ok()) {
+        Some(t) => t,
+        None => return PrCacheResult::Stale,
+    };
+    let cached_branch = match lines.next() {
+        Some(b) => b,
+        None => return PrCacheResult::Stale,
+    };
 
     // Validate branch matches
     if cached_branch != branch {
         let _ = fs::remove_file(&cache_path);
-        return None;
+        return PrCacheResult::Stale;
     }
 
-    // Check TTL
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if now.saturating_sub(timestamp) > PR_CACHE_TTL {
-        return None;
-    }
+    let age = now.saturating_sub(timestamp);
 
-    // Rest is JSON - check for error marker first
+    // Rest is JSON - check for special markers first
     let json_str: String = lines.collect::<Vec<_>>().join("\n");
 
-    // Skip if this was an error (ERROR marker) - don't treat as valid cache
-    if json_str.starts_with("ERROR:") {
-        return None;
+    // Handle NO_PR marker (negative cache with longer TTL)
+    if json_str == "NO_PR" {
+        if age < PR_NEGATIVE_CACHE_TTL {
+            return PrCacheResult::NoPr;
+        } else {
+            return PrCacheResult::Stale;
+        }
     }
 
-    let pr: GhPrJson = serde_json::from_str(&json_str).ok()?;
+    // Handle ERROR marker - don't cache errors, always retry
+    if json_str.starts_with("ERROR:") {
+        return PrCacheResult::Stale;
+    }
+
+    // Check normal TTL
+    if age > PR_CACHE_TTL {
+        return PrCacheResult::Stale;
+    }
+
+    // Parse JSON
+    let pr: GhPrJson = match serde_json::from_str(&json_str) {
+        Ok(p) => p,
+        Err(_) => return PrCacheResult::Stale,
+    };
 
     // Compute check status from rollup
     let check_status = match &pr.status_check_rollup {
@@ -301,7 +337,7 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
         }
     };
 
-    Some(PrCacheData {
+    PrCacheResult::Hit(PrCacheData {
         number: pr.number.unwrap_or(0) as u32,
         state: pr.state.unwrap_or_default(),
         url: pr.url.unwrap_or_default(),
@@ -371,8 +407,10 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     // 3. If gh succeeds with no output (exit 0, empty) -> write NO_PR (legitimate no PR)
     // 4. If gh fails (non-zero exit) -> write ERROR (don't cache as NO_PR)
     // 5. Atomic rename temp file to cache file
+    // Uses trap to ensure script cleanup on any exit path
     let script = format!(
         r#"#!/bin/sh
+trap 'rm -f {script_path}' EXIT
 cd {work_dir} || exit 1
 json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>&1)
 exit_code=$?
@@ -386,7 +424,6 @@ else
     printf '%s\n%s\nERROR:%s' {timestamp} {branch} "$json" > {temp_cache}
     mv -f {temp_cache} {cache_path}
 fi
-rm -f {script_path}
 "#,
         work_dir = shell_escape(work_dir),
         timestamp = now,
@@ -448,28 +485,11 @@ fn mark_refresh_attempt(git_dir: &str, branch: &str) {
 /// Get PR data - checks cache first, spawns refresh if needed
 /// Returns immediately with cached data or None (never blocks on network)
 fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
-    // Try cache first (fast path)
-    if let Some(cache) = load_pr_cache(&git.git_dir, &git.branch) {
-        return Some(cache);
-    }
-
-    // Check negative cache (NO_PR marker) - uses longer TTL
-    let cache_path = get_pr_cache_path(&git.git_dir, &git.branch);
-    if let Ok(content) = fs::read_to_string(&cache_path) {
-        if let Some(first_line) = content.lines().next() {
-            if let Ok(timestamp) = first_line.parse::<u64>() {
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                // If cache file exists and is recent, check for NO_PR marker
-                if now.saturating_sub(timestamp) < PR_NEGATIVE_CACHE_TTL {
-                    if content.contains("\nNO_PR") {
-                        return None; // Negative cache hit - no PR exists
-                    }
-                }
-            }
-        }
+    // Single cache read handles all states
+    match load_pr_cache(&git.git_dir, &git.branch) {
+        PrCacheResult::Hit(data) => return Some(data),
+        PrCacheResult::NoPr => return None, // Negative cache hit - no PR exists
+        PrCacheResult::Stale => {} // Continue to refresh
     }
 
     // Throttle refresh attempts to avoid process storms
@@ -981,17 +1001,19 @@ fn count_commits_not_in(repo: &gix::Repository, from: gix::ObjectId, exclude: gi
     }
 
     // Now count commits from `from` that aren't in exclude_set
+    // Don't break on first intersection - merges can have commits on both sides
     let Ok(from_iter) = repo.rev_walk([from]).all() else {
         return 0;
     };
     let mut count = 0u32;
+    let mut visited = 0u32;
     for info in from_iter {
         let Ok(info) = info else { break };
-        if exclude_set.contains(&info.id) {
-            break; // Hit common ancestor
+        visited += 1;
+        if !exclude_set.contains(&info.id) {
+            count += 1;
         }
-        count += 1;
-        if count > 999 {
+        if visited > 10000 {
             break; // Safety limit
         }
     }
