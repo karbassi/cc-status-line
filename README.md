@@ -26,7 +26,7 @@ Restart Claude Code to see the new status line.
 ```
  trips • d/api/endpoints
  main • feature-auth • +3 ~2 • ↑1
- PR #42 open • +5/-3 • checks passed
+ #42 • open • 2 comments • 5 files • checks passed
  Opus • 84% • verbose • ◔ 35m
  47m • resets 12m • 125K/42K
 ```
@@ -44,8 +44,9 @@ Restart Claude Code to see the new status line.
 ### Row 3: PR (optional, GitHub only)
 - PR number with clickable link (OSC 8)
 - State: open/merged/closed
-- Changed files: `+N/-N`
-- Check status: passed/failed/pending
+- Comments count
+- Changed files count
+- Check status: passed/failed/pending (clickable link to checks page)
 
 ### Row 4: Claude
 - Model (Opus/Sonnet/Haiku)
