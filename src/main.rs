@@ -640,14 +640,15 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     // PR number (white/default)
     write!(out, "#{}", pr.number).unwrap_or_default();
 
-    // State with color
-    let state_color = match pr.state.as_str() {
+    // State with color (case-insensitive match, display lowercase)
+    let state_lower = pr.state.to_lowercase();
+    let state_color = match state_lower.as_str() {
         "open" => TN_GREEN,
         "merged" => TN_PURPLE,
         "closed" => TN_RED,
         _ => TN_GRAY,
     };
-    write!(out, "{SEP}{state_color}{}{RESET}", pr.state).unwrap_or_default();
+    write!(out, "{SEP}{state_color}{}{RESET}", state_lower).unwrap_or_default();
 
     // Comments (if any)
     if pr.comments > 0 {
