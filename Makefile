@@ -5,7 +5,7 @@ FREEZE_FLAGS := --window --font.family "Menlo" --font.size 14 --shadow.blur 20 -
 DOCS_DIR := docs/screenshots
 
 # Consistent project path for screenshots
-PROJECT := /Users/demo/projects/weather-app
+PROJECT := ~/projects/weather-app
 
 build:
 	cargo build
