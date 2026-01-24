@@ -29,6 +29,12 @@ const TN_GRAY: &str = "\x1b[38;2;120;140;180m";
 const TN_RED: &str = "\x1b[38;2;247;118;142m";
 
 const SEP: &str = "\x1b[38;2;86;95;137m • \x1b[0m";
+
+// OSC 8 hyperlink escape sequences (using BEL terminator for broader compatibility)
+const OSC8_START: &str = "\x1b]8;;";
+const OSC8_MID: &str = "\x07";
+const OSC8_END: &str = "\x1b]8;;\x07";
+
 const TERM_WIDTH: usize = 50;
 
 fn hash_path(path: &str) -> u64 {
@@ -665,8 +671,12 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         Some(p) => p,
     };
 
-    // PR number (cyan)
-    write!(out, "{TN_CYAN}#{}{RESET}", pr.number).unwrap_or_default();
+    // PR number (cyan, clickable via OSC 8)
+    if !pr.url.is_empty() {
+        write!(out, "{OSC8_START}{}{OSC8_MID}{TN_CYAN}#{}{RESET}{OSC8_END}", pr.url, pr.number).unwrap_or_default();
+    } else {
+        write!(out, "{TN_CYAN}#{}{RESET}", pr.number).unwrap_or_default();
+    }
 
     // State with color (case-insensitive match, display lowercase)
     let state_lower = pr.state.to_lowercase();
@@ -696,9 +706,9 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         _ => {} // No checks or unknown status - show nothing
     }
 
-    // URL
+    // URL (clickable via OSC 8)
     if !pr.url.is_empty() {
-        write!(out, "{SEP}{TN_GRAY}{}{RESET}", pr.url).unwrap_or_default();
+        write!(out, "{SEP}{OSC8_START}{}{OSC8_MID}{TN_GRAY}{}{RESET}{OSC8_END}", pr.url, pr.url).unwrap_or_default();
     }
 
     writeln!(out).unwrap_or_default();
