@@ -46,6 +46,10 @@ struct ClaudeInput {
     output_style: OutputStyle,
     #[serde(default)]
     workspace: Workspace,
+    #[serde(default)]
+    git: GitInput,
+    #[serde(default)]
+    pr: PrInput,
 }
 
 #[derive(Deserialize, Default)]
@@ -82,6 +86,28 @@ struct Workspace {
     project_dir: Option<String>,
     #[serde(default)]
     current_dir: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct GitInput {
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    changed_files: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct PrInput {
+    #[serde(default)]
+    number: Option<u32>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    changed_files: Option<u32>,
+    #[serde(default)]
+    check_status: Option<String>,
 }
 
 /// Binary cache format for mmap (fixed 128 bytes)
@@ -299,8 +325,16 @@ fn main() {
     let mut out = BufWriter::new(stdout.lock());
 
     write_row1(&mut out, &data, &current_dir);
-    let git_repo = get_git_repo(&current_dir);
-    write_row2(&mut out, git_repo.as_ref());
+
+    // If JSON provides git.branch, skip filesystem detection
+    let git_repo = if data.git.branch.is_some() {
+        None
+    } else {
+        get_git_repo(&current_dir)
+    };
+
+    write_row2(&mut out, git_repo.as_ref(), &data.git);
+    write_pr_rows(&mut out, &data.pr);
     write_row3(&mut out, &data);
     write_row4(&mut out, &data);
 
@@ -427,35 +461,48 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     Some(GitRepo { repo, branch, worktree, git_dir })
 }
 
-fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
-    let git = match git {
+fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>, git_input: &GitInput) {
+    // Prioritize JSON input over filesystem detection
+    let branch = git_input.branch.as_deref()
+        .or_else(|| git.map(|g| g.branch.as_str()));
+
+    let branch = match branch {
         None => {
             writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default();
             return;
         }
-        Some(g) => g,
+        Some(b) => b,
     };
 
-    write!(out, "{TN_PURPLE}{}{RESET}", git.branch).unwrap_or_default();
+    write!(out, "{TN_PURPLE}{branch}{RESET}").unwrap_or_default();
 
-    if let Some(wt) = &git.worktree {
-        write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
+    // Worktree only from filesystem detection
+    if let Some(g) = git {
+        if let Some(wt) = &g.worktree {
+            write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
+        }
     }
 
-    // Try mmap cache first
-    let cache = load_mmap_cache(&git.git_dir);
-    let current_mtime = git.index_mtime();
-    let current_oid = git.head_oid();
-
+    // Get file stats: prefer JSON input, fallback to cache/detection
     let (files_changed, lines_added, lines_deleted, ahead, behind) =
-        if let Some(ref c) = cache {
-            if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
-                (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
+        if let Some(files) = git_input.changed_files {
+            (files, 0, 0, 0, 0)
+        } else if let Some(g) = git {
+            let cache = load_mmap_cache(&g.git_dir);
+            let current_mtime = g.index_mtime();
+            let current_oid = g.head_oid();
+
+            if let Some(ref c) = cache {
+                if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
+                    (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
+                } else {
+                    compute_and_cache_git_stats(g, current_mtime, &current_oid)
+                }
             } else {
-                compute_and_cache_git_stats(git, current_mtime, &current_oid)
+                compute_and_cache_git_stats(g, current_mtime, &current_oid)
             }
         } else {
-            compute_and_cache_git_stats(git, current_mtime, &current_oid)
+            (0, 0, 0, 0, 0)
         };
 
     if files_changed > 0 || lines_added > 0 || lines_deleted > 0 {
@@ -505,6 +552,39 @@ fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u3
     save_mmap_cache(&git.git_dir, &cache);
 
     (files_changed, lines_added, lines_deleted, ahead, behind)
+}
+
+fn write_pr_rows<W: Write>(out: &mut W, pr_input: &PrInput) {
+    // Only display if PR info is provided via JSON
+    let number = match pr_input.number {
+        Some(n) => n,
+        None => return,
+    };
+
+    let state = pr_input.state.as_deref().unwrap_or("open");
+    let state_color = match state {
+        "merged" => TN_PURPLE,
+        "closed" => TN_RED,
+        _ => TN_GREEN, // open
+    };
+
+    write!(out, "{state_color}#{number}{RESET}").unwrap_or_default();
+
+    if let Some(files) = pr_input.changed_files {
+        write!(out, "{SEP}{TN_GRAY}{files} files{RESET}").unwrap_or_default();
+    }
+
+    if let Some(check_status) = &pr_input.check_status {
+        let (check_color, check_icon) = match check_status.as_str() {
+            "passed" => (TN_GREEN, "✓"),
+            "failed" => (TN_RED, "✗"),
+            "pending" => (TN_ORANGE, "●"),
+            _ => (TN_GRAY, "?"),
+        };
+        write!(out, "{SEP}{check_color}{check_icon}{RESET}").unwrap_or_default();
+    }
+
+    writeln!(out).unwrap_or_default();
 }
 
 fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
