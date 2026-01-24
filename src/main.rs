@@ -657,15 +657,12 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         write!(out, "{SEP}{TN_GRAY}{} files{RESET}", pr.changed_files).unwrap_or_default();
     }
 
-    // Check status (if available)
-    if !pr.check_status.is_empty() {
-        let check_color = match pr.check_status.as_str() {
-            "passed" => TN_GREEN,
-            "failed" => TN_RED,
-            "pending" => TN_ORANGE,
-            _ => TN_GRAY,
-        };
-        write!(out, "{SEP}{check_color}checks {}{RESET}", pr.check_status).unwrap_or_default();
+    // Check status (only show if we have a valid status)
+    match pr.check_status.trim() {
+        "passed" => write!(out, "{SEP}{TN_GREEN}checks passed{RESET}").unwrap_or_default(),
+        "failed" => write!(out, "{SEP}{TN_RED}checks failed{RESET}").unwrap_or_default(),
+        "pending" => write!(out, "{SEP}{TN_ORANGE}checks pending{RESET}").unwrap_or_default(),
+        _ => {} // No checks or unknown status - show nothing
     }
 
     // URL (dim, for easy copy)
