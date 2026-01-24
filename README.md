@@ -21,11 +21,12 @@ Restart Claude Code to see the new status line.
 
 ## Design
 
-4-row status line with Tokyo Night dim colors and dot (•) dividers.
+4-5 row status line with Tokyo Night colors and dot (•) dividers. PR row appears when a PR exists for the current branch.
 
 ```
  trips • d/api/endpoints
  main • feature-auth • +3 ~2 • ↑1
+ PR #42 open • +5/-3 • checks passed
  Opus • 84% • verbose • ◔ 35m
  47m • resets 12m • 125K/42K
 ```
@@ -40,20 +41,26 @@ Restart Claude Code to see the new status line.
 - Status: `+N` added, `~N` modified, `-N` deleted, `?N` untracked
 - Remote: `↑N` ahead, `↓N` behind
 
-### Row 3: Claude
+### Row 3: PR (optional, GitHub only)
+- PR number with clickable link (OSC 8)
+- State: open/merged/closed
+- Changed files: `+N/-N`
+- Check status: passed/failed/pending
+
+### Row 4: Claude
 - Model (Opus/Sonnet/Haiku)
 - Context % remaining
 - Output mode
 - Block timer
 
-### Row 4: Session
+### Row 5: Session
 - Session duration
 - Block reset countdown
 - Tokens (in/out)
 
 ## Style
 
-- **Theme**: Tokyo Night (dim)
+- **Theme**: Tokyo Night
 - **Dividers**: Dot (•)
 - **Colors by segment**:
   - Blue `#7aa2f7` - project
