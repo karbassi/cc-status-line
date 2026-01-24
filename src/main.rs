@@ -28,6 +28,13 @@ const TN_TEAL: &str = "\x1b[2;38;2;42;195;222m";
 const TN_GRAY: &str = "\x1b[2;38;2;86;95;137m";
 const TN_RED: &str = "\x1b[2;38;2;247;118;142m";
 
+// Bright (non-dim) versions for PR row
+const BR_GREEN: &str = "\x1b[38;2;158;206;106m";
+const BR_PURPLE: &str = "\x1b[38;2;187;154;247m";
+const BR_RED: &str = "\x1b[38;2;247;118;142m";
+const BR_ORANGE: &str = "\x1b[38;2;255;158;100m";
+const BR_CYAN: &str = "\x1b[38;2;125;207;255m";
+
 const SEP: &str = "\x1b[2;38;2;86;95;137m • \x1b[0m";
 const TERM_WIDTH: usize = 50;
 
@@ -665,40 +672,40 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         Some(p) => p,
     };
 
-    // PR number (white/default)
-    write!(out, "#{}", pr.number).unwrap_or_default();
+    // PR number (cyan, bright)
+    write!(out, "{BR_CYAN}#{}{RESET}", pr.number).unwrap_or_default();
 
     // State with color (case-insensitive match, display lowercase)
     let state_lower = pr.state.to_lowercase();
     let state_color = match state_lower.as_str() {
-        "open" => TN_GREEN,
-        "merged" => TN_PURPLE,
-        "closed" => TN_RED,
+        "open" => BR_GREEN,
+        "merged" => BR_PURPLE,
+        "closed" => BR_RED,
         _ => TN_GRAY,
     };
     write!(out, "{SEP}{state_color}{}{RESET}", state_lower).unwrap_or_default();
 
     // Comments (if any)
     if pr.comments > 0 {
-        write!(out, "{SEP}{TN_GRAY}{} comments{RESET}", pr.comments).unwrap_or_default();
+        write!(out, "{SEP}{} comments", pr.comments).unwrap_or_default();
     }
 
     // Changed files
     if pr.changed_files > 0 {
-        write!(out, "{SEP}{TN_GRAY}{} files{RESET}", pr.changed_files).unwrap_or_default();
+        write!(out, "{SEP}{} files", pr.changed_files).unwrap_or_default();
     }
 
     // Check status (only show if we have a valid status)
     match pr.check_status.trim() {
-        "passed" => write!(out, "{SEP}{TN_GREEN}checks passed{RESET}").unwrap_or_default(),
-        "failed" => write!(out, "{SEP}{TN_RED}checks failed{RESET}").unwrap_or_default(),
-        "pending" => write!(out, "{SEP}{TN_ORANGE}checks pending{RESET}").unwrap_or_default(),
+        "passed" => write!(out, "{SEP}{BR_GREEN}checks passed{RESET}").unwrap_or_default(),
+        "failed" => write!(out, "{SEP}{BR_RED}checks failed{RESET}").unwrap_or_default(),
+        "pending" => write!(out, "{SEP}{BR_ORANGE}checks pending{RESET}").unwrap_or_default(),
         _ => {} // No checks or unknown status - show nothing
     }
 
-    // URL (dim, for easy copy)
+    // URL (dimmer, for easy copy but not distracting)
     if !pr.url.is_empty() {
-        write!(out, "{SEP}{TN_GRAY}{}{RESET}", pr.url).unwrap_or_default();
+        write!(out, "{SEP}{TN_CYAN}{}{RESET}", pr.url).unwrap_or_default();
     }
 
     writeln!(out).unwrap_or_default();
