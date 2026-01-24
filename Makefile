@@ -18,6 +18,7 @@ clean:
 
 # Generate all screenshot permutations as PNGs
 screenshots: release
+	@rm -rf $(DOCS_DIR)
 	@mkdir -p $(DOCS_DIR)
 	@echo "Generating screenshots..."
 	@echo '{"workspace":{"project_dir":"$(PROJECT)","current_dir":"$(PROJECT)"}}' | ./target/release/cc-statusline | freeze $(FREEZE_FLAGS) -o $(DOCS_DIR)/01-no-git.png
