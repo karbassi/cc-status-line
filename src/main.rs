@@ -6,6 +6,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -150,6 +151,139 @@ impl MmapCache {
         let oid_bytes = oid.as_bytes();
         oid_bytes.len() <= 40 && self.head_oid[..oid_bytes.len()] == *oid_bytes
     }
+}
+
+// ============================================================================
+// PR Cache
+// ============================================================================
+
+/// PR cache data - text-based for simplicity
+#[derive(Default, Clone)]
+struct PrCacheData {
+    number: u32,
+    state: String,       // "open", "merged", "closed"
+    url: String,
+    comments: u32,
+    changed_files: u32,
+    check_status: String, // "passed", "failed", "pending", ""
+    #[allow(dead_code)]
+    timestamp: u64,       // cache creation time (used in cache validation)
+    #[allow(dead_code)]
+    branch: String,       // branch name for invalidation (used in cache validation)
+}
+
+const PR_CACHE_TTL: u64 = 60; // seconds
+
+fn get_pr_cache_path(repo_path: &str, branch: &str) -> String {
+    let key = format!("{}:{}", repo_path, branch);
+    format!("/tmp/cc-pr-{:016x}.cache", hash_path(&key))
+}
+
+fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
+    let cache_path = get_pr_cache_path(repo_path, branch);
+    let content = fs::read_to_string(&cache_path).ok()?;
+    let mut lines = content.lines();
+
+    let number: u32 = lines.next()?.parse().ok()?;
+    let state = lines.next()?.to_string();
+    let url = lines.next()?.to_string();
+    let comments: u32 = lines.next()?.parse().ok()?;
+    let changed_files: u32 = lines.next()?.parse().ok()?;
+    let check_status = lines.next()?.to_string();
+    let timestamp: u64 = lines.next()?.parse().ok()?;
+    let cached_branch = lines.next()?.to_string();
+
+    // Validate branch matches
+    if cached_branch != branch {
+        let _ = fs::remove_file(&cache_path);
+        return None;
+    }
+
+    // Check TTL
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(timestamp) > PR_CACHE_TTL {
+        return None; // Stale but don't delete - return None to trigger refresh
+    }
+
+    Some(PrCacheData {
+        number,
+        state,
+        url,
+        comments,
+        changed_files,
+        check_status,
+        timestamp,
+        branch: cached_branch,
+    })
+}
+
+// ============================================================================
+// PR Fetch (background only)
+// ============================================================================
+
+/// Check if remote is GitHub
+fn is_github_remote(git_dir: &str) -> bool {
+    let config_path = format!("{}/config", git_dir.trim_end_matches('/'));
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        return content.contains("github.com");
+    }
+    false
+}
+
+/// Spawn background process to refresh PR cache
+fn spawn_pr_refresh(git_dir: &str, branch: &str) {
+    // Only proceed if this is a GitHub repo
+    if !is_github_remote(git_dir) {
+        return;
+    }
+
+    let branch = branch.to_string();
+    let git_dir = git_dir.to_string();
+
+    // Try to spawn a background process
+    // Use sh -c to fork and detach
+    let script = format!(
+        r#"
+        cd "$(dirname "{git_dir}")" 2>/dev/null
+        if command -v gh >/dev/null 2>&1; then
+            result=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup --jq '"\(.number)\n\(.state)\n\(.url)\n\((.comments // []) | length)\n\(.changedFiles)\n\(if .statusCheckRollup == null then "" elif (.statusCheckRollup | map(select(.conclusion != "SUCCESS" and .conclusion != "SKIPPED")) | length) == 0 then "passed" elif (.statusCheckRollup | map(select(.conclusion == "FAILURE" or .conclusion == "CANCELLED")) | length) > 0 then "failed" else "pending" end)"' 2>/dev/null)
+            if [ -n "$result" ]; then
+                timestamp=$(date +%s)
+                echo "$result
+$timestamp
+{branch}" > /tmp/cc-pr-{cache_hash:016x}.cache
+            fi
+        fi
+        "#,
+        git_dir = git_dir,
+        branch = branch,
+        cache_hash = hash_path(&format!("{}:{}", git_dir, branch))
+    );
+
+    let _ = Command::new("sh")
+        .args(["-c", &format!("({}) &", script)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Get PR data - checks cache first, spawns refresh if needed
+/// Returns immediately with cached data or None (never blocks on network)
+fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
+    // Try cache first (fast path)
+    if let Some(cache) = load_pr_cache(&git.git_dir, &git.branch) {
+        return Some(cache);
+    }
+
+    // Cache miss or stale - spawn background refresh only
+    // Don't block - return None and let the next render show PR data
+    spawn_pr_refresh(&git.git_dir, &git.branch);
+
+    None
 }
 
 /// Holds repository state for lazy evaluation of expensive git operations
@@ -301,6 +435,7 @@ fn main() {
     write_row1(&mut out, &data, &current_dir);
     let git_repo = get_git_repo(&current_dir);
     write_row2(&mut out, git_repo.as_ref());
+    write_pr_rows(&mut out, git_repo.as_ref());
     write_row3(&mut out, &data);
     write_row4(&mut out, &data);
 
@@ -485,6 +620,62 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     }
 
     writeln!(out).unwrap_or_default();
+}
+
+/// Write PR info rows (only shown when a PR exists for current branch)
+fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
+    let git = match git {
+        None => return,
+        Some(g) => g,
+    };
+
+    let pr = match get_pr_data(git) {
+        None => return,
+        Some(p) => p,
+    };
+
+    // Row 1: PR number, state, comments, files, checks
+    write!(out, "  ").unwrap_or_default(); // indent for visual hierarchy
+
+    // PR number (white/default)
+    write!(out, "#{}", pr.number).unwrap_or_default();
+
+    // State with color
+    let state_color = match pr.state.as_str() {
+        "open" => TN_GREEN,
+        "merged" => TN_PURPLE,
+        "closed" => TN_RED,
+        _ => TN_GRAY,
+    };
+    write!(out, "{SEP}{state_color}{}{RESET}", pr.state).unwrap_or_default();
+
+    // Comments (if any)
+    if pr.comments > 0 {
+        write!(out, "{SEP}{TN_GRAY}{} comments{RESET}", pr.comments).unwrap_or_default();
+    }
+
+    // Changed files
+    if pr.changed_files > 0 {
+        write!(out, "{SEP}{TN_GRAY}{} files{RESET}", pr.changed_files).unwrap_or_default();
+    }
+
+    // Check status (if available)
+    if !pr.check_status.is_empty() {
+        let check_color = match pr.check_status.as_str() {
+            "passed" => TN_GREEN,
+            "failed" => TN_RED,
+            "pending" => TN_ORANGE,
+            _ => TN_GRAY,
+        };
+        write!(out, "{SEP}{check_color}checks {}{RESET}", pr.check_status).unwrap_or_default();
+    }
+
+    writeln!(out).unwrap_or_default();
+
+    // Row 2: URL (dim, for easy copy)
+    if !pr.url.is_empty() {
+        writeln!(out, "  {TN_GRAY}{}{RESET}", pr.url).unwrap_or_default();
+    }
 }
 
 fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32, u32, u32) {
