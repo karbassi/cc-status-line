@@ -275,8 +275,20 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
 // ============================================================================
 
 /// Check if remote is GitHub
+/// Resolves the common git directory for worktree support
 fn is_github_remote(git_dir: &str) -> bool {
-    let config_path = format!("{}/config", git_dir.trim_end_matches('/'));
+    // In linked worktrees, git_dir is .git/worktrees/<name>, not the main .git dir.
+    // The config with remotes lives in the common dir, so resolve it first.
+    let common_dir = Command::new("git")
+        .args(["--git-dir", git_dir, "rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| git_dir.trim_end_matches('/').to_string());
+
+    let config_path = Path::new(&common_dir).join("config");
     if let Ok(content) = fs::read_to_string(&config_path) {
         return content.contains("github.com");
     }
