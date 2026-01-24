@@ -296,17 +296,11 @@ fn is_github_remote(git_dir: &str) -> bool {
 }
 
 /// Spawn background process to refresh PR cache
-fn spawn_pr_refresh(git_dir: &str, branch: &str) {
+fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     // Only proceed if this is a GitHub repo
     if !is_github_remote(git_dir) {
         return;
     }
-
-    // Get working directory (parent of .git)
-    let work_dir = Path::new(git_dir)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
 
     let cache_path = get_pr_cache_path(git_dir, branch);
     let now = SystemTime::now()
@@ -338,7 +332,7 @@ fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
 
     // Cache miss or stale - spawn background refresh only
     // Don't block - return None and let the next render show PR data
-    spawn_pr_refresh(&git.git_dir, &git.branch);
+    spawn_pr_refresh(&git.git_dir, &git.work_dir, &git.branch);
 
     None
 }
@@ -349,6 +343,7 @@ struct GitRepo {
     branch: String,
     worktree: Option<String>,
     git_dir: String,
+    work_dir: String,
 }
 
 impl GitRepo {
@@ -594,18 +589,25 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     // Try cache first
     if let Some(cache) = get_cached_git_info(dir) {
         let repo = gix::open(&cache.git_path).ok()?;
+        let work_dir = repo.work_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.to_string());
         let worktree = get_worktree_name(&cache.git_path);
         return Some(GitRepo {
             repo,
             branch: cache.branch,
             worktree,
             git_dir: cache.git_path,
+            work_dir,
         });
     }
 
     // Discover repo
     let repo = gix::discover(dir).ok()?;
     let git_dir = repo.git_dir().to_string_lossy().into_owned();
+    let work_dir = repo.work_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string());
 
     // Get branch name from HEAD
     let head = repo.head().ok()?;
@@ -616,7 +618,7 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     let worktree = get_worktree_name(&git_dir);
 
     cache_git_info(dir, &git_dir, &branch);
-    Some(GitRepo { repo, branch, worktree, git_dir })
+    Some(GitRepo { repo, branch, worktree, git_dir, work_dir })
 }
 
 fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
