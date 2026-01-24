@@ -634,9 +634,6 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         Some(p) => p,
     };
 
-    // Row 1: PR number, state, comments, files, checks
-    write!(out, "  ").unwrap_or_default(); // indent for visual hierarchy
-
     // PR number (white/default)
     write!(out, "#{}", pr.number).unwrap_or_default();
 
@@ -671,12 +668,12 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         write!(out, "{SEP}{check_color}checks {}{RESET}", pr.check_status).unwrap_or_default();
     }
 
-    writeln!(out).unwrap_or_default();
-
-    // Row 2: URL (dim, for easy copy)
+    // URL (dim, for easy copy)
     if !pr.url.is_empty() {
-        writeln!(out, "  {TN_GRAY}{}{RESET}", pr.url).unwrap_or_default();
+        write!(out, "{SEP}{TN_GRAY}{}{RESET}", pr.url).unwrap_or_default();
     }
+
+    writeln!(out).unwrap_or_default();
 }
 
 fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32, u32, u32) {
