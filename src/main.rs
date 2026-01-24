@@ -76,6 +76,15 @@ fn hash_path(path: &str) -> u64 {
     path.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
 }
 
+/// Atomic rename that works on Windows (removes destination first if it exists)
+fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
+    // On Windows, fs::rename fails if destination exists
+    // Remove destination first, then rename
+    #[cfg(windows)]
+    let _ = fs::remove_file(to);
+    fs::rename(from, to)
+}
+
 #[derive(Deserialize, Default)]
 struct ClaudeInput {
     #[serde(default)]
@@ -425,8 +434,9 @@ if [ $exit_code -eq 0 ] && [ -n "$json" ]; then
     printf '%s\n%s\n%s' {timestamp} {branch} "$json" > {temp_cache}
     mv -f {temp_cache} {cache_path}
 elif [ $exit_code -ne 0 ]; then
-    # gh failed - check if it's "no PR" error
-    err=$(gh pr view 2>&1 >/dev/null)
+    # gh failed - check if it's "no PR" error by running again and capturing stderr only
+    # Use file descriptor swap: redirect stdout to /dev/null first, then capture stderr
+    err=$(gh pr view 2>&1 1>/dev/null)
     case "$err" in
         *"no pull requests"*|*"no open pull requests"*|*"Could not resolve"*)
             # Legitimate "no PR" - negative cache
@@ -490,10 +500,10 @@ fn should_skip_refresh(git_dir: &str, branch: &str) -> bool {
 /// Mark that we've attempted a refresh
 fn mark_refresh_attempt(git_dir: &str, branch: &str) {
     let attempt_path = get_pr_attempt_path(git_dir, branch);
-    // Atomic write
+    // Atomic write (Windows-compatible)
     let temp_path = get_cache_dir().join(format!("pr-attempt-tmp-{}", random_hex()));
     if fs::write(&temp_path, "").is_ok() {
-        let _ = fs::rename(&temp_path, &attempt_path);
+        let _ = atomic_rename(&temp_path, &attempt_path);
     }
 }
 
@@ -623,7 +633,7 @@ fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     }
     drop(mmap);
     drop(file);
-    let _ = fs::rename(&temp_path, &cache_path);
+    let _ = atomic_rename(&temp_path, &cache_path);
 }
 
 struct GitPathCache {
@@ -665,10 +675,10 @@ fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
     let cache_path = get_cache_dir().join(format!("gitpath-{:016x}.cache", hash_path(working_dir)));
     let head_mtime = get_head_mtime(git_path);
     let content = format!("{}\n{}\n{}", git_path, branch, head_mtime);
-    // Atomic write: write to temp, then rename
+    // Atomic write (Windows-compatible): write to temp, then rename
     let temp_path = get_cache_dir().join(format!("gitpath-tmp-{}.cache", random_hex()));
     if fs::write(&temp_path, &content).is_ok() {
-        let _ = fs::rename(&temp_path, &cache_path);
+        let _ = atomic_rename(&temp_path, &cache_path);
     }
 }
 
