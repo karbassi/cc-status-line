@@ -26,12 +26,15 @@ fn get_cache_dir() -> &'static PathBuf {
             .unwrap_or_else(|_| {
                 let home = get_home();
                 if home.is_empty() {
-                    // Fallback to /tmp with user-specific subdirectory
+                    // Fallback to system temp dir with user-specific subdirectory
+                    // Use std::env::temp_dir() for portability
+                    let mut base = env::temp_dir();
                     #[cfg(unix)]
                     let uid = unsafe { libc::getuid() };
                     #[cfg(not(unix))]
                     let uid = std::process::id();
-                    PathBuf::from(format!("/tmp/cc-statusline-{}", uid))
+                    base.push(format!("cc-statusline-{}", uid));
+                    base
                 } else {
                     PathBuf::from(home).join(".cache")
                 }
@@ -253,7 +256,10 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         Err(_) => return PrCacheResult::Stale,
     };
 
-    // First line is timestamp, rest is JSON
+    // Cache file format:
+    //   1st line: UNIX timestamp (seconds since epoch)
+    //   2nd line: cached branch name
+    //   remaining lines: JSON payload, "NO_PR" marker, or "ERROR:..." marker
     let mut lines = content.lines();
     let timestamp: u64 = match lines.next().and_then(|s| s.parse().ok()) {
         Some(t) => t,
@@ -399,30 +405,40 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     let temp_cache = get_cache_dir().join(format!("pr-tmp-{}.cache", random_suffix));
     let temp_cache_str = temp_cache.to_string_lossy();
     let script_path = get_cache_dir().join(format!("pr-refresh-{}.sh", random_suffix));
-    let script_path_str = script_path.to_string_lossy();
 
     // Script logic:
-    // 1. Run gh pr view and capture both stdout and exit code
-    // 2. If gh succeeds with output -> write PR data
-    // 3. If gh succeeds with no output (exit 0, empty) -> write NO_PR (legitimate no PR)
-    // 4. If gh fails (non-zero exit) -> write ERROR (don't cache as NO_PR)
+    // 1. Run gh pr view and capture stdout/stderr separately
+    // 2. If gh succeeds with JSON output -> write PR data
+    // 3. If gh fails with "no pull requests" message -> write NO_PR (legitimate no PR)
+    // 4. If gh fails for other reasons -> write ERROR (don't negative cache)
     // 5. Atomic rename temp file to cache file
-    // Uses trap to ensure script cleanup on any exit path
+    // Uses trap with $0 for cleanup to avoid quoting issues with shell_escape
     let script = format!(
         r#"#!/bin/sh
-trap 'rm -f {script_path}' EXIT
+trap 'rm -f "$0"' EXIT
 cd {work_dir} || exit 1
-json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>&1)
+# Capture stdout and stderr separately to detect "no PR" vs other errors
+json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null)
 exit_code=$?
 if [ $exit_code -eq 0 ] && [ -n "$json" ]; then
+    # Success with JSON output - PR exists
     printf '%s\n%s\n%s' {timestamp} {branch} "$json" > {temp_cache}
     mv -f {temp_cache} {cache_path}
-elif [ $exit_code -eq 0 ]; then
-    printf '%s\n%s\nNO_PR' {timestamp} {branch} > {temp_cache}
-    mv -f {temp_cache} {cache_path}
-else
-    printf '%s\n%s\nERROR:%s' {timestamp} {branch} "$json" > {temp_cache}
-    mv -f {temp_cache} {cache_path}
+elif [ $exit_code -ne 0 ]; then
+    # gh failed - check if it's "no PR" error
+    err=$(gh pr view 2>&1 >/dev/null)
+    case "$err" in
+        *"no pull requests"*|*"no open pull requests"*|*"Could not resolve"*)
+            # Legitimate "no PR" - negative cache
+            printf '%s\n%s\nNO_PR' {timestamp} {branch} > {temp_cache}
+            mv -f {temp_cache} {cache_path}
+            ;;
+        *)
+            # Other error (auth, network, etc) - don't negative cache
+            printf '%s\n%s\nERROR:%s' {timestamp} {branch} "$err" > {temp_cache}
+            mv -f {temp_cache} {cache_path}
+            ;;
+    esac
 fi
 "#,
         work_dir = shell_escape(work_dir),
@@ -430,7 +446,6 @@ fi
         branch = shell_escape(branch),
         temp_cache = shell_escape(&temp_cache_str),
         cache_path = shell_escape(&cache_path_str),
-        script_path = shell_escape(&script_path_str),
     );
 
     if fs::write(&script_path, &script).is_err() {
