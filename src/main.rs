@@ -814,6 +814,26 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     writeln!(out).unwrap_or_default();
 }
 
+/// Find the configured upstream ref for a branch
+/// Reads branch.<name>.remote and branch.<name>.merge from git config
+fn find_upstream_ref(repo: &gix::Repository, branch: &str) -> Option<String> {
+    let config = repo.config_snapshot();
+
+    // Get branch.<name>.remote (e.g., "origin")
+    let remote_key = format!("branch.{}.remote", branch);
+    let remote = config.string(remote_key.as_str())?;
+    let remote = remote.to_string();
+
+    // Get branch.<name>.merge (e.g., "refs/heads/main")
+    let merge_key = format!("branch.{}.merge", branch);
+    let merge_ref = config.string(merge_key.as_str())?;
+    let merge_ref = merge_ref.to_string();
+
+    // Convert refs/heads/X to refs/remotes/<remote>/X
+    let upstream_branch = merge_ref.strip_prefix("refs/heads/")?;
+    Some(format!("refs/remotes/{}/{}", remote, upstream_branch))
+}
+
 /// Get ahead/behind counts relative to upstream using gix
 fn get_ahead_behind(repo: &gix::Repository, branch: &str) -> (u32, u32) {
     // Get HEAD commit
@@ -822,8 +842,11 @@ fn get_ahead_behind(repo: &gix::Repository, branch: &str) -> (u32, u32) {
         Err(_) => return (0, 0),
     };
 
-    // Try to find upstream tracking branch
-    let upstream_ref = format!("refs/remotes/origin/{}", branch);
+    // Try to find configured upstream for this branch first
+    // Falls back to origin/<branch> if no upstream configured
+    let upstream_ref = find_upstream_ref(repo, branch)
+        .unwrap_or_else(|| format!("refs/remotes/origin/{}", branch));
+
     let upstream_id = match repo.find_reference(&upstream_ref) {
         Ok(r) => match r.into_fully_peeled_id() {
             Ok(id) => id,
