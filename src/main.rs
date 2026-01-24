@@ -157,19 +157,33 @@ impl MmapCache {
 // PR Cache
 // ============================================================================
 
-/// PR cache data - text-based for simplicity
+/// PR cache data - parsed from gh JSON output
 #[derive(Default, Clone)]
 struct PrCacheData {
     number: u32,
-    state: String,       // "open", "merged", "closed"
+    state: String,
     url: String,
     comments: u32,
     changed_files: u32,
     check_status: String, // "passed", "failed", "pending", ""
-    #[allow(dead_code)]
-    timestamp: u64,       // cache creation time (used in cache validation)
-    #[allow(dead_code)]
-    branch: String,       // branch name for invalidation (used in cache validation)
+}
+
+/// JSON structure from gh pr view
+#[derive(Deserialize, Default)]
+struct GhPrJson {
+    number: Option<u64>,
+    state: Option<String>,
+    url: Option<String>,
+    comments: Option<Vec<serde_json::Value>>,
+    #[serde(rename = "changedFiles")]
+    changed_files: Option<u64>,
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<Vec<GhCheckRun>>,
+}
+
+#[derive(Deserialize)]
+struct GhCheckRun {
+    conclusion: Option<String>,
 }
 
 const PR_CACHE_TTL: u64 = 60; // seconds
@@ -182,16 +196,11 @@ fn get_pr_cache_path(repo_path: &str, branch: &str) -> String {
 fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
     let cache_path = get_pr_cache_path(repo_path, branch);
     let content = fs::read_to_string(&cache_path).ok()?;
-    let mut lines = content.lines();
 
-    let number: u32 = lines.next()?.parse().ok()?;
-    let state = lines.next()?.to_string();
-    let url = lines.next()?.to_string();
-    let comments: u32 = lines.next()?.parse().ok()?;
-    let changed_files: u32 = lines.next()?.parse().ok()?;
-    let check_status = lines.next()?.to_string();
+    // First line is timestamp, rest is JSON
+    let mut lines = content.lines();
     let timestamp: u64 = lines.next()?.parse().ok()?;
-    let cached_branch = lines.next()?.to_string();
+    let cached_branch = lines.next()?;
 
     // Validate branch matches
     if cached_branch != branch {
@@ -205,18 +214,45 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if now.saturating_sub(timestamp) > PR_CACHE_TTL {
-        return None; // Stale but don't delete - return None to trigger refresh
+        return None;
     }
 
+    // Rest is JSON
+    let json_str: String = lines.collect::<Vec<_>>().join("\n");
+    let pr: GhPrJson = serde_json::from_str(&json_str).ok()?;
+
+    // Compute check status from rollup
+    let check_status = match &pr.status_check_rollup {
+        None => String::new(),
+        Some(checks) if checks.is_empty() => String::new(),
+        Some(checks) => {
+            let has_failure = checks.iter().any(|c| {
+                matches!(c.conclusion.as_deref(), Some("FAILURE") | Some("CANCELLED"))
+            });
+            let all_done = checks.iter().all(|c| c.conclusion.is_some());
+            let all_passed = checks.iter().all(|c| {
+                matches!(c.conclusion.as_deref(), Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL"))
+            });
+
+            if has_failure {
+                "failed".to_string()
+            } else if all_passed {
+                "passed".to_string()
+            } else if !all_done {
+                "pending".to_string()
+            } else {
+                String::new()
+            }
+        }
+    };
+
     Some(PrCacheData {
-        number,
-        state,
-        url,
-        comments,
-        changed_files,
+        number: pr.number.unwrap_or(0) as u32,
+        state: pr.state.unwrap_or_default(),
+        url: pr.url.unwrap_or_default(),
+        comments: pr.comments.map(|c| c.len() as u32).unwrap_or(0),
+        changed_files: pr.changed_files.unwrap_or(0) as u32,
         check_status,
-        timestamp,
-        branch: cached_branch,
     })
 }
 
@@ -240,31 +276,26 @@ fn spawn_pr_refresh(git_dir: &str, branch: &str) {
         return;
     }
 
-    let branch = branch.to_string();
-    let git_dir = git_dir.to_string();
+    // Get working directory (parent of .git)
+    let work_dir = Path::new(git_dir)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
 
-    // Try to spawn a background process
-    // Use sh -c to fork and detach
-    let script = format!(
-        r#"
-        cd "$(dirname "{git_dir}")" 2>/dev/null
-        if command -v gh >/dev/null 2>&1; then
-            result=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup --jq '"\(.number)\n\(.state)\n\(.url)\n\((.comments // []) | length)\n\(.changedFiles)\n\(if .statusCheckRollup == null then "" elif (.statusCheckRollup | map(select(.conclusion != "SUCCESS" and .conclusion != "SKIPPED")) | length) == 0 then "passed" elif (.statusCheckRollup | map(select(.conclusion == "FAILURE" or .conclusion == "CANCELLED")) | length) > 0 then "failed" else "pending" end)"' 2>/dev/null)
-            if [ -n "$result" ]; then
-                timestamp=$(date +%s)
-                echo "$result
-$timestamp
-{branch}" > /tmp/cc-pr-{cache_hash:016x}.cache
-            fi
-        fi
-        "#,
-        git_dir = git_dir,
-        branch = branch,
-        cache_hash = hash_path(&format!("{}:{}", git_dir, branch))
+    let cache_path = get_pr_cache_path(git_dir, branch);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Minimal shell to detach gh process and write cache with timestamp header
+    let cmd = format!(
+        r#"cd '{}' && json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null) && [ -n "$json" ] && printf '%s\n%s\n%s' '{}' '{}' "$json" > '{}'"#,
+        work_dir, now, branch, cache_path
     );
 
     let _ = Command::new("sh")
-        .args(["-c", &format!("({}) &", script)])
+        .args(["-c", &cmd])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
