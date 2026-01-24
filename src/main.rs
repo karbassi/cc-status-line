@@ -706,11 +706,6 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         _ => {} // No checks or unknown status - show nothing
     }
 
-    // URL (clickable via OSC 8)
-    if !pr.url.is_empty() {
-        write!(out, "{SEP}{OSC8_START}{}{OSC8_MID}{TN_GRAY}{}{RESET}{OSC8_END}", pr.url, pr.url).unwrap_or_default();
-    }
-
     writeln!(out).unwrap_or_default();
 }
 
