@@ -5,15 +5,43 @@ use std::borrow::Cow;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn get_home() -> &'static str {
     HOME_DIR.get_or_init(|| env::var("HOME").unwrap_or_default())
+}
+
+/// Get secure per-user cache directory
+/// Uses $XDG_CACHE_HOME/cc-statusline or ~/.cache/cc-statusline
+fn get_cache_dir() -> &'static PathBuf {
+    CACHE_DIR.get_or_init(|| {
+        let base = env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = get_home();
+                if home.is_empty() {
+                    // Fallback to /tmp with user-specific subdirectory
+                    PathBuf::from(format!("/tmp/cc-statusline-{}", unsafe { libc::getuid() }))
+                } else {
+                    PathBuf::from(home).join(".cache")
+                }
+            });
+        let cache_dir = base.join("cc-statusline");
+        // Create directory with restricted permissions (0700)
+        let _ = fs::create_dir_all(&cache_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700));
+        }
+        cache_dir
+    })
 }
 
 // Tokyo Night Colors (bright)
@@ -196,14 +224,14 @@ const PR_CACHE_TTL: u64 = 60; // seconds
 const PR_NEGATIVE_CACHE_TTL: u64 = 300; // 5 minutes for "no PR" cache
 const PR_REFRESH_THROTTLE: u64 = 30; // minimum seconds between refresh attempts
 
-fn get_pr_cache_path(repo_path: &str, branch: &str) -> String {
+fn get_pr_cache_path(repo_path: &str, branch: &str) -> PathBuf {
     let key = format!("{}:{}", repo_path, branch);
-    format!("/tmp/cc-pr-{:016x}.cache", hash_path(&key))
+    get_cache_dir().join(format!("pr-{:016x}.cache", hash_path(&key)))
 }
 
-fn get_pr_attempt_path(repo_path: &str, branch: &str) -> String {
+fn get_pr_attempt_path(repo_path: &str, branch: &str) -> PathBuf {
     let key = format!("{}:{}", repo_path, branch);
-    format!("/tmp/cc-pr-attempt-{:016x}", hash_path(&key))
+    get_cache_dir().join(format!("pr-attempt-{:016x}", hash_path(&key)))
 }
 
 fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
@@ -230,8 +258,14 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> Option<PrCacheData> {
         return None;
     }
 
-    // Rest is JSON
+    // Rest is JSON - check for error marker first
     let json_str: String = lines.collect::<Vec<_>>().join("\n");
+
+    // Skip if this was an error (ERROR marker) - don't treat as valid cache
+    if json_str.starts_with("ERROR:") {
+        return None;
+    }
+
     let pr: GhPrJson = serde_json::from_str(&json_str).ok()?;
 
     // Compute check status from rollup
@@ -297,8 +331,20 @@ fn is_github_remote(git_dir: &str) -> bool {
     false
 }
 
+/// Generate a random hex string for temp file names
+fn random_hex() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("{:016x}{:08x}", nanos, pid)
+}
+
 /// Spawn background process to refresh PR cache
-/// Uses a wrapper script approach to avoid shell injection while still detaching properly
+/// Uses atomic writes: write to temp file, then rename
+/// Distinguishes "no PR" from gh errors to avoid false negative caching
 fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     // Only proceed if this is a GitHub repo
     if !is_github_remote(git_dir) {
@@ -306,29 +352,59 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     }
 
     let cache_path = get_pr_cache_path(git_dir, branch);
+    let cache_path_str = cache_path.to_string_lossy();
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Write a temp script with properly escaped values to avoid injection
-    // The script file itself contains the literal values, not shell-interpolated
-    // Write NO_PR marker if gh returns empty (negative cache)
-    let script_path = format!("/tmp/cc-pr-refresh-{}.sh", std::process::id());
+    // Create temp files with random suffix in secure cache directory
+    let random_suffix = random_hex();
+    let temp_cache = get_cache_dir().join(format!("pr-tmp-{}.cache", random_suffix));
+    let temp_cache_str = temp_cache.to_string_lossy();
+    let script_path = get_cache_dir().join(format!("pr-refresh-{}.sh", random_suffix));
+    let script_path_str = script_path.to_string_lossy();
+
+    // Script logic:
+    // 1. Run gh pr view and capture both stdout and exit code
+    // 2. If gh succeeds with output -> write PR data
+    // 3. If gh succeeds with no output (exit 0, empty) -> write NO_PR (legitimate no PR)
+    // 4. If gh fails (non-zero exit) -> write ERROR (don't cache as NO_PR)
+    // 5. Atomic rename temp file to cache file
     let script = format!(
-        "#!/bin/sh\ncd {} && json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null); if [ -n \"$json\" ]; then printf '%s\\n%s\\n%s' {} {} \"$json\" > {}; else printf '%s\\n%s\\nNO_PR' {} {} > {}; fi; rm -f {}\n",
-        shell_escape(work_dir),
-        now,
-        shell_escape(branch),
-        shell_escape(&cache_path),
-        now,
-        shell_escape(branch),
-        shell_escape(&cache_path),
-        shell_escape(&script_path),
+        r#"#!/bin/sh
+cd {work_dir} || exit 1
+json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>&1)
+exit_code=$?
+if [ $exit_code -eq 0 ] && [ -n "$json" ]; then
+    printf '%s\n%s\n%s' {timestamp} {branch} "$json" > {temp_cache}
+    mv -f {temp_cache} {cache_path}
+elif [ $exit_code -eq 0 ]; then
+    printf '%s\n%s\nNO_PR' {timestamp} {branch} > {temp_cache}
+    mv -f {temp_cache} {cache_path}
+else
+    printf '%s\n%s\nERROR:%s' {timestamp} {branch} "$json" > {temp_cache}
+    mv -f {temp_cache} {cache_path}
+fi
+rm -f {script_path}
+"#,
+        work_dir = shell_escape(work_dir),
+        timestamp = now,
+        branch = shell_escape(branch),
+        temp_cache = shell_escape(&temp_cache_str),
+        cache_path = shell_escape(&cache_path_str),
+        script_path = shell_escape(&script_path_str),
     );
 
     if fs::write(&script_path, &script).is_err() {
         return;
+    }
+
+    // Set executable permission
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
     }
 
     let _ = Command::new("sh")
@@ -362,7 +438,11 @@ fn should_skip_refresh(git_dir: &str, branch: &str) -> bool {
 /// Mark that we've attempted a refresh
 fn mark_refresh_attempt(git_dir: &str, branch: &str) {
     let attempt_path = get_pr_attempt_path(git_dir, branch);
-    let _ = fs::write(&attempt_path, "");
+    // Atomic write
+    let temp_path = get_cache_dir().join(format!("pr-attempt-tmp-{}", random_hex()));
+    if fs::write(&temp_path, "").is_ok() {
+        let _ = fs::rename(&temp_path, &attempt_path);
+    }
 }
 
 /// Get PR data - checks cache first, spawns refresh if needed
@@ -467,8 +547,8 @@ impl GitRepo {
     }
 }
 
-fn get_cache_path(git_dir: &str) -> String {
-    format!("/tmp/cc-status-{:016x}.cache", hash_path(git_dir))
+fn get_cache_path(git_dir: &str) -> PathBuf {
+    get_cache_dir().join(format!("status-{:016x}.cache", hash_path(git_dir)))
 }
 
 fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
@@ -480,22 +560,35 @@ fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
 
 fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     let cache_path = get_cache_path(git_dir);
+    // Atomic write: write to temp file, then rename
+    let temp_path = get_cache_dir().join(format!("status-tmp-{}.cache", random_hex()));
+
     let file = match OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
-        .open(&cache_path)
+        .open(&temp_path)
     {
         Ok(f) => f,
         Err(_) => return,
     };
     if file.set_len(CACHE_SIZE as u64).is_err() {
+        let _ = fs::remove_file(&temp_path);
         return;
     }
     let mut mmap = match unsafe { MmapMut::map_mut(&file) } {
         Ok(m) => m,
-        Err(_) => return,
+        Err(_) => {
+            let _ = fs::remove_file(&temp_path);
+            return;
+        }
     };
     cache.to_bytes(&mut mmap);
-    let _ = mmap.flush();
+    if mmap.flush().is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return;
+    }
+    drop(mmap);
+    drop(file);
+    let _ = fs::rename(&temp_path, &cache_path);
 }
 
 struct GitPathCache {
@@ -512,7 +605,7 @@ fn get_head_mtime(git_path: &str) -> u64 {
 }
 
 fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
-    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash_path(working_dir));
+    let cache_path = get_cache_dir().join(format!("gitpath-{:016x}.cache", hash_path(working_dir)));
     let content = fs::read_to_string(&cache_path).ok()?;
     let mut lines = content.lines();
 
@@ -534,10 +627,14 @@ fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
 }
 
 fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
-    let cache_path = format!("/tmp/cc-gitpath-{:016x}.cache", hash_path(working_dir));
+    let cache_path = get_cache_dir().join(format!("gitpath-{:016x}.cache", hash_path(working_dir)));
     let head_mtime = get_head_mtime(git_path);
     let content = format!("{}\n{}\n{}", git_path, branch, head_mtime);
-    let _ = fs::write(&cache_path, content);
+    // Atomic write: write to temp, then rename
+    let temp_path = get_cache_dir().join(format!("gitpath-tmp-{}.cache", random_hex()));
+    if fs::write(&temp_path, &content).is_ok() {
+        let _ = fs::rename(&temp_path, &cache_path);
+    }
 }
 
 fn main() {

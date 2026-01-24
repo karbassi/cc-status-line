@@ -57,6 +57,7 @@ name = "cc-statusline"
 version = "0.1.2"
 dependencies = [
  "gix",
+ "libc",
  "memmap2",
  "serde",
  "serde_json",
