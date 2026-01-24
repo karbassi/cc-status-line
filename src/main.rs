@@ -296,6 +296,7 @@ fn is_github_remote(git_dir: &str) -> bool {
 }
 
 /// Spawn background process to refresh PR cache
+/// Uses a wrapper script approach to avoid shell injection while still detaching properly
 fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     // Only proceed if this is a GitHub repo
     if !is_github_remote(git_dir) {
@@ -308,18 +309,33 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Minimal shell to detach gh process and write cache with timestamp header
-    let cmd = format!(
-        r#"cd '{}' && json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null) && [ -n "$json" ] && printf '%s\n%s\n%s' '{}' '{}' "$json" > '{}'"#,
-        work_dir, now, branch, cache_path
+    // Write a temp script with properly escaped values to avoid injection
+    // The script file itself contains the literal values, not shell-interpolated
+    let script_path = format!("/tmp/cc-pr-refresh-{}.sh", std::process::id());
+    let script = format!(
+        "#!/bin/sh\ncd {} && json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null) && [ -n \"$json\" ] && printf '%s\\n%s\\n%s' {} {} \"$json\" > {} ; rm -f {}\n",
+        shell_escape(work_dir),
+        now,
+        shell_escape(branch),
+        shell_escape(&cache_path),
+        shell_escape(&script_path),
     );
 
+    if fs::write(&script_path, &script).is_err() {
+        return;
+    }
+
     let _ = Command::new("sh")
-        .args(["-c", &cmd])
+        .arg(&script_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Get PR data - checks cache first, spawns refresh if needed
