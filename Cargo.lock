@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "cc-statusline"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gix",
  "memmap2",
