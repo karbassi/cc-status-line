@@ -711,16 +711,20 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     let current_mtime = git.index_mtime();
     let current_oid = git.head_oid();
 
-    let (files_changed, lines_added, lines_deleted, ahead, behind) =
+    // Cache file stats (only depends on local state)
+    let (files_changed, lines_added, lines_deleted) =
         if let Some(ref c) = cache {
             if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
-                (c.files_changed, c.lines_added, c.lines_deleted, c.ahead, c.behind)
+                (c.files_changed, c.lines_added, c.lines_deleted)
             } else {
                 compute_and_cache_git_stats(git, current_mtime, &current_oid)
             }
         } else {
             compute_and_cache_git_stats(git, current_mtime, &current_oid)
         };
+
+    // Always compute ahead/behind fresh (depends on upstream which can change independently)
+    let (ahead, behind) = get_ahead_behind(&git.repo, &git.branch);
 
     if files_changed > 0 || lines_added > 0 || lines_deleted > 0 {
         write!(out, "{SEP}").unwrap_or_default();
@@ -874,9 +878,8 @@ fn count_commits_not_in(repo: &gix::Repository, from: gix::ObjectId, exclude: gi
     count
 }
 
-fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32, u32, u32) {
+fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32) {
     let (files_changed, lines_added, lines_deleted) = git.diff_stats().unwrap_or((0, 0, 0));
-    let (ahead, behind) = get_ahead_behind(&git.repo, &git.branch);
 
     let mut cache = MmapCache::default();
     cache.index_mtime = mtime;
@@ -886,11 +889,9 @@ fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u3
     cache.files_changed = files_changed;
     cache.lines_added = lines_added;
     cache.lines_deleted = lines_deleted;
-    cache.ahead = ahead;
-    cache.behind = behind;
     save_mmap_cache(&git.git_dir, &cache);
 
-    (files_changed, lines_added, lines_deleted, ahead, behind)
+    (files_changed, lines_added, lines_deleted)
 }
 
 fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
