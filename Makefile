@@ -11,7 +11,7 @@ clean:
 
 # Screenshot settings
 DOCS := docs/screenshots
-FREEZE := freeze --window --font.family "Menlo" --font.size 14 --shadow.blur 20 --shadow.y 10 --border.radius 10 -m 40
+FREEZE := freeze -c full --font.family "Menlo"
 RUN := ./target/release/cc-statusline | $(FREEZE) -o $(DOCS)
 
 # Common JSON fragments
