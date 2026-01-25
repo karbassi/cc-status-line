@@ -60,8 +60,20 @@ fn get_cache_dir() -> &'static PathBuf {
                 let dir_uid = metadata.uid();
                 let our_uid = unsafe { libc::getuid() };
                 if dir_uid != our_uid {
-                    // Directory not owned by us - don't use it, fall back to a safe location
-                    // In practice, this means caching is disabled for this session
+                    // Directory not owned by us - try a per-user temp directory
+                    let mut fallback_dir = env::temp_dir();
+                    fallback_dir.push(format!("cc-statusline-{our_uid}"));
+                    let _ = fs::create_dir_all(&fallback_dir);
+                    let _ = fs::set_permissions(&fallback_dir, fs::Permissions::from_mode(0o700));
+
+                    // Verify the fallback is owned by us
+                    if let Ok(fb_meta) = fs::metadata(&fallback_dir)
+                        && fb_meta.is_dir() && fb_meta.uid() == our_uid
+                    {
+                        return fallback_dir;
+                    }
+                    // If no safe directory can be created, disable caching
+                    // Use a path that will fail gracefully on file operations
                     return PathBuf::from("/dev/null");
                 }
             }
@@ -442,6 +454,23 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         }
     };
 
+    // Validate required fields - treat missing/invalid data as stale
+    #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
+    let number = match pr.number {
+        Some(n) if n > 0 => n as u32,
+        _ => return PrCacheResult::Stale,
+    };
+
+    let state = match pr.state {
+        Some(s) if !s.is_empty() => s,
+        _ => return PrCacheResult::Stale,
+    };
+
+    let url = match pr.url {
+        Some(u) if !u.is_empty() => u,
+        _ => return PrCacheResult::Stale,
+    };
+
     // Prefer commentsCount (numeric) over comments array to avoid large allocations
     #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
     let comments = pr.comments_count
@@ -451,9 +480,9 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
 
     #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
     PrCacheResult::Hit(PrCacheData {
-        number: pr.number.unwrap_or(0) as u32,
-        state: pr.state.unwrap_or_default(),
-        url: pr.url.unwrap_or_default(),
+        number,
+        state,
+        url,
         comments,
         changed_files: pr.changed_files.unwrap_or(0) as u32,
         check_status,
