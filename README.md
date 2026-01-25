@@ -51,11 +51,11 @@ Restart Claude Code to see the new status line.
 **Requirements for PR row:**
 - GitHub repository with origin remote
 - Authentication via one of:
-  - `GITHUB_TOKEN` or `GH_TOKEN` environment variable
-  - GitHub CLI (`gh auth login`)
-  - Git credential helper with GitHub credentials
+  - `GITHUB_TOKEN` or `GH_TOKEN` environment variable (all platforms)
+  - GitHub CLI (`gh auth login`) - macOS/Linux only
+  - Git credential helper with GitHub credentials (all platforms)
 
-If no authentication is available, the PR row will not appear.
+If no authentication is available, the PR row will not appear. On Windows, use an environment variable or git credential helper since `gh auth login` is not used by the native HTTP path.
 
 ### Row 4: Claude
 - Model (Opus/Sonnet/Haiku)

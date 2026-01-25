@@ -634,9 +634,10 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
     let cache_path = get_pr_cache_path(git_dir, branch);
 
-    // GitHub API: GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open
+    // GitHub API: GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=all
+    // Use state=all to show merged/closed PRs too (not just open)
     let url = format!(
-        "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=open",
+        "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=all",
         owner, repo, owner, branch
     );
 
@@ -802,8 +803,9 @@ fn mark_refresh_attempt(git_dir: &str, branch: &str) {
     }
 }
 
-/// Get PR data - checks cache first, spawns refresh if needed
-/// Returns immediately with cached data or None (never blocks on network)
+/// Get PR data - checks cache first, triggers refresh if needed
+/// On Unix with gh CLI: spawns background process (non-blocking)
+/// On other platforms or without gh: runs synchronous HTTP refresh (may block ~500ms)
 fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
     // Single cache read handles all states
     match load_pr_cache(&git.git_dir, &git.branch) {
