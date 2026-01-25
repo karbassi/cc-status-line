@@ -74,17 +74,17 @@ fn is_gh_available() -> bool {
 /// Tries: 1) GITHUB_TOKEN env var, 2) GH_TOKEN env var, 3) git credential fill
 fn get_github_token() -> Option<String> {
     // Try GITHUB_TOKEN env first
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    if let Ok(token) = env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(token);
     }
 
     // Try GH_TOKEN (used by gh CLI)
-    if let Ok(token) = env::var("GH_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    if let Ok(token) = env::var("GH_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(token);
     }
 
     // Try git credential helper
@@ -237,15 +237,17 @@ impl MmapCache {
             return None;
         }
 
-        let mut cache = MmapCache::default();
-        cache.index_mtime = u64::from_le_bytes(data[8..16].try_into().ok()?);
-        cache.head_oid.copy_from_slice(&data[16..56]);
-        cache.files_changed = u32::from_le_bytes(data[56..60].try_into().ok()?);
-        cache.lines_added = u32::from_le_bytes(data[60..64].try_into().ok()?);
-        cache.lines_deleted = u32::from_le_bytes(data[64..68].try_into().ok()?);
-        cache.ahead = u32::from_le_bytes(data[68..72].try_into().ok()?);
-        cache.behind = u32::from_le_bytes(data[72..76].try_into().ok()?);
-        Some(cache)
+        let mut head_oid = [0u8; 40];
+        head_oid.copy_from_slice(&data[16..56]);
+        Some(MmapCache {
+            index_mtime: u64::from_le_bytes(data[8..16].try_into().ok()?),
+            head_oid,
+            files_changed: u32::from_le_bytes(data[56..60].try_into().ok()?),
+            lines_added: u32::from_le_bytes(data[60..64].try_into().ok()?),
+            lines_deleted: u32::from_le_bytes(data[64..68].try_into().ok()?),
+            ahead: u32::from_le_bytes(data[68..72].try_into().ok()?),
+            behind: u32::from_le_bytes(data[72..76].try_into().ok()?),
+        })
     }
 
     fn to_bytes(&self, buf: &mut [u8]) {
@@ -803,13 +805,13 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
 /// Check if we should skip refresh (throttled or negative cache)
 fn should_skip_refresh(git_dir: &str, branch: &str) -> bool {
     let attempt_path = get_pr_attempt_path(git_dir, branch);
-    if let Ok(metadata) = fs::metadata(&attempt_path) {
-        if let Ok(mtime) = metadata.modified() {
-            let now = SystemTime::now();
-            if let Ok(elapsed) = now.duration_since(mtime) {
-                // Skip if we attempted recently
-                return elapsed.as_secs() < PR_REFRESH_THROTTLE;
-            }
+    if let Ok(metadata) = fs::metadata(&attempt_path)
+        && let Ok(mtime) = metadata.modified()
+    {
+        let now = SystemTime::now();
+        if let Ok(elapsed) = now.duration_since(mtime) {
+            // Skip if we attempted recently
+            return elapsed.as_secs() < PR_REFRESH_THROTTLE;
         }
     }
     false
@@ -1038,7 +1040,7 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
     let display_cwd: Cow<str> = if !home.is_empty() && current_dir.starts_with(home) {
         Cow::Owned(format!("~{}", &current_dir[home.len()..]))
     } else {
-        Cow::Borrowed(&current_dir)
+        Cow::Borrowed(current_dir)
     };
 
     let path_width = TERM_WIDTH.saturating_sub(project_name.len()).saturating_sub(3).max(10);
@@ -1079,8 +1081,7 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     let mut result = String::with_capacity(max_width + 10);
 
     if try1_len <= max_width || seg_count <= 2 {
-        for i in 0..seg_count.saturating_sub(2) {
-            let start = seg_starts[i];
+        for &start in seg_starts.iter().take(seg_count.saturating_sub(2)) {
             if start < bytes.len() && bytes[start] != b'/' {
                 result.push(bytes[start] as char);
                 result.push('/');
@@ -1090,8 +1091,7 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
         result.push('/');
         result.push_str(last_seg);
     } else {
-        for i in 0..seg_count - 1 {
-            let start = seg_starts[i];
+        for &start in seg_starts.iter().take(seg_count - 1) {
             if start < bytes.len() && bytes[start] != b'/' {
                 result.push(bytes[start] as char);
                 result.push('/');
@@ -1373,14 +1373,20 @@ fn count_commits_not_in(repo: &gix::Repository, from: gix::ObjectId, exclude: gi
 fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32) {
     let (files_changed, lines_added, lines_deleted) = git.diff_stats().unwrap_or((0, 0, 0));
 
-    let mut cache = MmapCache::default();
-    cache.index_mtime = mtime;
     let oid_bytes = oid.as_bytes();
     let copy_len = oid_bytes.len().min(40);
-    cache.head_oid[..copy_len].copy_from_slice(&oid_bytes[..copy_len]);
-    cache.files_changed = files_changed;
-    cache.lines_added = lines_added;
-    cache.lines_deleted = lines_deleted;
+    let mut head_oid = [0u8; 40];
+    head_oid[..copy_len].copy_from_slice(&oid_bytes[..copy_len]);
+
+    let cache = MmapCache {
+        index_mtime: mtime,
+        head_oid,
+        files_changed,
+        lines_added,
+        lines_deleted,
+        ahead: 0,
+        behind: 0,
+    };
     save_mmap_cache(&git.git_dir, &cache);
 
     (files_changed, lines_added, lines_deleted)
@@ -1389,11 +1395,11 @@ fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u3
 fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
     let mut has_content = false;
 
-    if let Some(model) = &data.model.display_name {
-        if model != "Unknown" {
-            write!(out, "{TN_ORANGE}{model}{RESET}").unwrap_or_default();
-            has_content = true;
-        }
+    if let Some(model) = &data.model.display_name
+        && model != "Unknown"
+    {
+        write!(out, "{TN_ORANGE}{model}{RESET}").unwrap_or_default();
+        has_content = true;
     }
 
     let context_pct = data.context_window.remaining_percentage.unwrap_or(100.0) as u32;
@@ -1403,12 +1409,12 @@ fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
         has_content = true;
     }
 
-    if let Some(mode) = &data.output_style.name {
-        if mode != "default" {
-            if has_content { write!(out, "{SEP}").unwrap_or_default(); }
-            write!(out, "{TN_BLUE}{mode}{RESET}").unwrap_or_default();
-            has_content = true;
-        }
+    if let Some(mode) = &data.output_style.name
+        && mode != "default"
+    {
+        if has_content { write!(out, "{SEP}").unwrap_or_default(); }
+        write!(out, "{TN_BLUE}{mode}{RESET}").unwrap_or_default();
+        has_content = true;
     }
 
     if has_content {
