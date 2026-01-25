@@ -21,11 +21,12 @@ Restart Claude Code to see the new status line.
 
 ## Design
 
-4-row status line with Tokyo Night dim colors and dot (•) dividers.
+4-5 row status line with Tokyo Night colors and dot (•) dividers. PR row appears when a PR exists for the current branch.
 
 ```
  trips • d/api/endpoints
- main • feature-auth • +3 ~2 • ↑1
+ main • feature-auth • 3 files • ↑1
+ #42 • open • 2 comments • 5 files • checks passed
  Opus • 84% • verbose • ◔ 35m
  47m • resets 12m • 125K/42K
 ```
@@ -37,23 +38,39 @@ Restart Claude Code to see the new status line.
 ### Row 2: Git
 - Branch name
 - Worktree name (if active)
-- Status: `+N` added, `~N` modified, `-N` deleted, `?N` untracked
+- Changed files count
 - Remote: `↑N` ahead, `↓N` behind
 
-### Row 3: Claude
+### Row 3: PR (optional, GitHub only)
+- PR number with clickable link (OSC 8)
+- State: open/merged/closed
+- Comments count
+- Changed files count
+- Check status: passed/failed/pending (clickable link to checks page)
+
+**Requirements for PR row:**
+- GitHub repository with origin remote
+- Authentication via one of:
+  - `GITHUB_TOKEN` or `GH_TOKEN` environment variable (all platforms)
+  - GitHub CLI (`gh auth login`) - macOS/Linux only
+  - Git credential helper with GitHub credentials (all platforms)
+
+If no authentication is available, the PR row will not appear. On Windows, use an environment variable or git credential helper since `gh auth login` is not used by the native HTTP path.
+
+### Row 4: Claude
 - Model (Opus/Sonnet/Haiku)
 - Context % remaining
 - Output mode
 - Block timer
 
-### Row 4: Session
+### Row 5: Session
 - Session duration
 - Block reset countdown
 - Tokens (in/out)
 
 ## Style
 
-- **Theme**: Tokyo Night (dim)
+- **Theme**: Tokyo Night
 - **Dividers**: Dot (•)
 - **Colors by segment**:
   - Blue `#7aa2f7` - project
@@ -73,7 +90,7 @@ Restart Claude Code to see the new status line.
 | Bash | 80 ms | 59 ms |
 | Rust | 3.7 ms | 3.0 ms |
 
-**20x faster than bash.** Binary <1MB, ~1.4MB RAM.
+**20x faster than bash.** Binary ~2MB, ~1.4MB RAM.
 
 Optimizations:
 - gix (pure Rust git, minimal features)
