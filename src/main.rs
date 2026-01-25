@@ -140,10 +140,14 @@ fn hash_path(path: &str) -> u64 {
     path.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
 }
 
-/// Atomic rename that works on Windows (removes destination first if it exists)
+/// Best-effort cross-platform rename that overwrites the destination.
+///
+/// On Unix-like platforms this is typically atomic. On Windows, `fs::rename`
+/// fails if the destination exists, so we remove the destination first and
+/// then rename. This is *not* a truly atomic replacement on Windows, as
+/// there is a brief window where the destination path does not exist.
 fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
-    // On Windows, fs::rename fails if destination exists
-    // Remove destination first, then rename
+    // On Windows, fs::rename fails if destination exists; remove it first.
     #[cfg(windows)]
     let _ = fs::remove_file(to);
     fs::rename(from, to)
@@ -449,17 +453,9 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
 // ============================================================================
 
 /// Check if remote is GitHub
-/// Uses gix `common_dir()` for worktree support
+/// Delegates to `parse_github_remote` which validates the origin URL as GitHub
 fn is_github_remote(git_dir: &str) -> bool {
-    // Use gix to get the common dir (handles worktrees automatically)
-    let common_dir = gix::open(git_dir)
-        .ok().map_or_else(|| Path::new(git_dir).to_path_buf(), |repo| repo.common_dir().to_path_buf());
-
-    let config_path = common_dir.join("config");
-    if let Ok(content) = fs::read_to_string(&config_path) {
-        return content.contains("github.com");
-    }
-    false
+    parse_github_remote(git_dir).is_some()
 }
 
 /// Parse GitHub owner/repo from git remote URL
@@ -489,8 +485,9 @@ fn parse_github_remote(git_dir: &str) -> Option<(String, String)> {
 }
 
 /// Parse owner/repo from a GitHub URL
+/// Validates the host is exactly `github.com` to avoid false positives
 fn parse_github_url(url: &str) -> Option<(String, String)> {
-    // SSH format: git@github.com:owner/repo.git
+    // SSH format: git@github.com:owner/repo.git (exact prefix match)
     if let Some(rest) = url.strip_prefix("git@github.com:") {
         let path = rest.trim_end_matches(".git");
         let mut parts = path.splitn(2, '/');
@@ -502,29 +499,40 @@ fn parse_github_url(url: &str) -> Option<(String, String)> {
     }
 
     // HTTPS format: https://github.com/owner/repo.git
-    if url.contains("github.com/") {
-        let start = url.find("github.com/")? + 11;
-        let path = url[start..].trim_end_matches(".git");
-        let mut parts = path.splitn(2, '/');
-        let owner = parts.next()?.to_string();
-        let repo = parts.next()?.to_string();
-        if !owner.is_empty() && !repo.is_empty() {
-            return Some((owner, repo));
+    // Validate host is exactly github.com (not notgithub.com, etc.)
+    let url_lower = url.to_lowercase();
+    if url_lower.starts_with("https://github.com/") || url_lower.starts_with("http://github.com/") {
+        let proto_end = url.find("://")? + 3;
+        let path_start = proto_end + "github.com/".len();
+        if url.len() > path_start {
+            let path = url[path_start..].trim_end_matches(".git");
+            let mut parts = path.splitn(2, '/');
+            let owner = parts.next()?.to_string();
+            let repo = parts.next()?.to_string();
+            if !owner.is_empty() && !repo.is_empty() {
+                return Some((owner, repo));
+            }
         }
     }
 
     None
 }
 
-/// Generate a random hex string for temp file names
-fn random_hex() -> String {
+/// Generate a unique hex string for temp file names
+/// Uses timestamp + pid + atomic counter to avoid collisions within same process
+fn unique_hex() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[allow(clippy::cast_possible_truncation)] // Truncation is fine for uniqueness
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let pid = std::process::id();
-    format!("{nanos:016x}{pid:08x}")
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:016x}{pid:08x}{count:04x}")
 }
 
 /// Spawn background process to refresh PR cache using gh CLI
@@ -542,7 +550,7 @@ fn spawn_pr_refresh_gh(git_dir: &str, work_dir: &str, branch: &str) {
         .unwrap_or(0);
 
     // Create temp files with random suffix in secure cache directory
-    let random_suffix = random_hex();
+    let random_suffix = unique_hex();
     let temp_cache = get_cache_dir().join(format!("pr-tmp-{random_suffix}.cache"));
     let temp_cache_str = temp_cache.to_string_lossy();
     let script_path = get_cache_dir().join(format!("pr-refresh-{random_suffix}.sh"));
@@ -781,7 +789,7 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
     };
 
     // Atomic write to cache
-    let temp_path = get_cache_dir().join(format!("pr-tmp-{}.cache", random_hex()));
+    let temp_path = get_cache_dir().join(format!("pr-tmp-{}.cache", unique_hex()));
     if fs::write(&temp_path, &cache_content).is_ok() {
         let _ = atomic_rename(&temp_path, &cache_path);
     }
@@ -826,7 +834,7 @@ fn should_skip_refresh(git_dir: &str, branch: &str) -> bool {
 fn mark_refresh_attempt(git_dir: &str, branch: &str) {
     let attempt_path = get_pr_attempt_path(git_dir, branch);
     // Atomic write (Windows-compatible)
-    let temp_path = get_cache_dir().join(format!("pr-attempt-tmp-{}", random_hex()));
+    let temp_path = get_cache_dir().join(format!("pr-attempt-tmp-{}", unique_hex()));
     if fs::write(&temp_path, "").is_ok() {
         let _ = atomic_rename(&temp_path, &attempt_path);
     }
@@ -939,7 +947,7 @@ fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
 fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     let cache_path = get_cache_path(git_dir);
     // Atomic write: write to temp file, then rename
-    let temp_path = get_cache_dir().join(format!("status-tmp-{}.cache", random_hex()));
+    let temp_path = get_cache_dir().join(format!("status-tmp-{}.cache", unique_hex()));
 
     let Ok(file) = OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
@@ -1005,7 +1013,7 @@ fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
     let head_mtime = get_head_mtime(git_path);
     let content = format!("{git_path}\n{branch}\n{head_mtime}");
     // Atomic write (Windows-compatible): write to temp, then rename
-    let temp_path = get_cache_dir().join(format!("gitpath-tmp-{}.cache", random_hex()));
+    let temp_path = get_cache_dir().join(format!("gitpath-tmp-{}.cache", unique_hex()));
     if fs::write(&temp_path, &content).is_ok() {
         let _ = atomic_rename(&temp_path, &cache_path);
     }
