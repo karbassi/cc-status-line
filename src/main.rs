@@ -12,9 +12,15 @@ use std::time::SystemTime;
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static GH_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 fn get_home() -> &'static str {
-    HOME_DIR.get_or_init(|| env::var("HOME").unwrap_or_default())
+    HOME_DIR.get_or_init(|| {
+        // Try HOME first (Unix standard), then USERPROFILE (Windows standard)
+        env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .unwrap_or_default()
+    })
 }
 
 /// Get secure per-user cache directory
@@ -49,6 +55,63 @@ fn get_cache_dir() -> &'static PathBuf {
         }
         cache_dir
     })
+}
+
+/// Check if gh CLI is available (cached)
+fn is_gh_available() -> bool {
+    *GH_AVAILABLE.get_or_init(|| {
+        Command::new("gh")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Get GitHub token for API authentication
+/// Tries: 1) GITHUB_TOKEN env var, 2) git credential fill
+fn get_github_token() -> Option<String> {
+    // Try GITHUB_TOKEN env first
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    // Try GH_TOKEN (used by gh CLI)
+    if let Ok(token) = env::var("GH_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    // Try git credential helper
+    let mut child = Command::new("git")
+        .args(["credential", "fill"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Write credential request to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "protocol=https");
+        let _ = writeln!(stdin, "host=github.com");
+        let _ = writeln!(stdin);
+    }
+
+    // Parse password from output
+    let output = child.wait_with_output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(token) = line.strip_prefix("password=") {
+            return Some(token.to_string());
+        }
+    }
+    None
 }
 
 // Tokyo Night Colors (bright)
@@ -382,6 +445,62 @@ fn is_github_remote(git_dir: &str) -> bool {
     false
 }
 
+/// Parse GitHub owner/repo from git remote URL
+/// Handles: git@github.com:owner/repo.git, https://github.com/owner/repo.git
+fn parse_github_remote(git_dir: &str) -> Option<(String, String)> {
+    // Use gix to get the common dir (handles worktrees automatically)
+    let common_dir = gix::open(git_dir)
+        .ok()
+        .map(|repo| repo.common_dir().to_path_buf())
+        .unwrap_or_else(|| Path::new(git_dir).to_path_buf());
+
+    let config_path = common_dir.join("config");
+    let content = fs::read_to_string(&config_path).ok()?;
+
+    // Find origin remote URL
+    let mut in_origin_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin_section = line == "[remote \"origin\"]";
+            continue;
+        }
+        if in_origin_section && line.starts_with("url = ") {
+            let url = &line[6..];
+            return parse_github_url(url);
+        }
+    }
+    None
+}
+
+/// Parse owner/repo from a GitHub URL
+fn parse_github_url(url: &str) -> Option<(String, String)> {
+    // SSH format: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let path = rest.trim_end_matches(".git");
+        let mut parts = path.splitn(2, '/');
+        let owner = parts.next()?.to_string();
+        let repo = parts.next()?.to_string();
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some((owner, repo));
+        }
+    }
+
+    // HTTPS format: https://github.com/owner/repo.git
+    if url.contains("github.com/") {
+        let start = url.find("github.com/")? + 11;
+        let path = url[start..].trim_end_matches(".git");
+        let mut parts = path.splitn(2, '/');
+        let owner = parts.next()?.to_string();
+        let repo = parts.next()?.to_string();
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some((owner, repo));
+        }
+    }
+
+    None
+}
+
 /// Generate a random hex string for temp file names
 fn random_hex() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -393,14 +512,12 @@ fn random_hex() -> String {
     format!("{:016x}{:08x}", nanos, pid)
 }
 
-/// Spawn background process to refresh PR cache
+/// Spawn background process to refresh PR cache using gh CLI
 /// Uses atomic writes: write to temp file, then rename
 /// Distinguishes "no PR" from gh errors to avoid false negative caching
-fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
-    // Only proceed if this is a GitHub repo
-    if !is_github_remote(git_dir) {
-        return;
-    }
+/// Only available on Unix (requires sh shell)
+#[cfg(unix)]
+fn spawn_pr_refresh_gh(git_dir: &str, work_dir: &str, branch: &str) {
 
     let cache_path = get_pr_cache_path(git_dir, branch);
     let cache_path_str = cache_path.to_string_lossy();
@@ -480,6 +597,183 @@ fi
 /// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Spawn background thread to refresh PR cache using native HTTP
+/// Works on all platforms, no gh CLI required
+fn spawn_pr_refresh_native(git_dir: &str, branch: &str) {
+    // Get owner/repo from remote URL
+    let (owner, repo) = match parse_github_remote(git_dir) {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Get auth token (required for API access)
+    let token = match get_github_token() {
+        Some(t) => t,
+        None => return, // No auth, skip PR feature
+    };
+
+    let git_dir = git_dir.to_string();
+    let branch = branch.to_string();
+
+    // Spawn background thread for HTTP call
+    std::thread::spawn(move || {
+        fetch_pr_data_native(&git_dir, &branch, &owner, &repo, &token);
+    });
+}
+
+/// Fetch PR data using native HTTP (ureq)
+fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, token: &str) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let cache_path = get_pr_cache_path(git_dir, branch);
+
+    // GitHub API: GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=open",
+        owner, repo, owner, branch
+    );
+
+    let response = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {}", token))
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "cc-statusline")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .call();
+
+    let cache_content = match response {
+        Ok(resp) => {
+            let body = match resp.into_string() {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+
+            // Parse as array of PRs
+            let prs: Vec<serde_json::Value> = match serde_json::from_str(&body) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            if prs.is_empty() {
+                // No PR for this branch - negative cache
+                format!("{}\n{}\nNO_PR", now, branch)
+            } else {
+                // Found PR - convert to gh-compatible format
+                let pr = &prs[0];
+                let pr_number = pr["number"].as_u64().unwrap_or(0);
+                let pr_url = pr["html_url"].as_str().unwrap_or("");
+
+                // Fetch additional PR details (comments, check status)
+                let detail_url = format!(
+                    "https://api.github.com/repos/{}/{}/pulls/{}",
+                    owner, repo, pr_number
+                );
+                let detail_resp = ureq::get(&detail_url)
+                    .set("Authorization", &format!("Bearer {}", token))
+                    .set("Accept", "application/vnd.github+json")
+                    .set("User-Agent", "cc-statusline")
+                    .set("X-GitHub-Api-Version", "2022-11-28")
+                    .call();
+
+                let (comments_count, changed_files) = match detail_resp {
+                    Ok(resp) => {
+                        let body = resp.into_string().unwrap_or_default();
+                        let detail: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        (
+                            detail["comments"].as_u64().unwrap_or(0) +
+                            detail["review_comments"].as_u64().unwrap_or(0),
+                            detail["changed_files"].as_u64().unwrap_or(0)
+                        )
+                    }
+                    Err(_) => (0, 0),
+                };
+
+                // Fetch check runs status
+                let checks_url = format!(
+                    "https://api.github.com/repos/{}/{}/commits/{}/check-runs",
+                    owner, repo, pr["head"]["sha"].as_str().unwrap_or("")
+                );
+                let checks_resp = ureq::get(&checks_url)
+                    .set("Authorization", &format!("Bearer {}", token))
+                    .set("Accept", "application/vnd.github+json")
+                    .set("User-Agent", "cc-statusline")
+                    .set("X-GitHub-Api-Version", "2022-11-28")
+                    .call();
+
+                let check_rollup: Vec<serde_json::Value> = match checks_resp {
+                    Ok(resp) => {
+                        let body = resp.into_string().unwrap_or_default();
+                        let checks: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        checks["check_runs"]
+                            .as_array()
+                            .map(|runs| {
+                                runs.iter()
+                                    .map(|run| {
+                                        serde_json::json!({
+                                            "conclusion": run["conclusion"]
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }
+                    Err(_) => vec![],
+                };
+
+                // Build gh-compatible JSON
+                let gh_json = serde_json::json!({
+                    "number": pr_number,
+                    "state": pr["state"],
+                    "url": pr_url,
+                    "comments": vec![serde_json::Value::Null; comments_count as usize],
+                    "changedFiles": changed_files,
+                    "statusCheckRollup": check_rollup
+                });
+
+                format!("{}\n{}\n{}", now, branch, gh_json)
+            }
+        }
+        Err(ureq::Error::Status(404, _)) => {
+            // Repo not found or no access - negative cache
+            format!("{}\n{}\nNO_PR", now, branch)
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            // API error (401 auth, 403 rate limit, etc) - don't negative cache
+            format!("{}\n{}\nERROR:HTTP {}", now, branch, code)
+        }
+        Err(e) => {
+            // Network error - don't negative cache
+            format!("{}\n{}\nERROR:{}", now, branch, e)
+        }
+    };
+
+    // Atomic write to cache
+    let temp_path = get_cache_dir().join(format!("pr-tmp-{}.cache", random_hex()));
+    if fs::write(&temp_path, &cache_content).is_ok() {
+        let _ = atomic_rename(&temp_path, &cache_path);
+    }
+}
+
+/// Dispatch PR refresh to appropriate implementation
+fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
+    // Only proceed if this is a GitHub repo
+    if !is_github_remote(git_dir) {
+        return;
+    }
+
+    // On Unix, prefer gh if available (handles auth, rate limits better)
+    #[cfg(unix)]
+    if is_gh_available() {
+        spawn_pr_refresh_gh(git_dir, work_dir, branch);
+        return;
+    }
+
+    // Fallback to native HTTP (works on all platforms, no gh required)
+    spawn_pr_refresh_native(git_dir, branch);
 }
 
 /// Check if we should skip refresh (throttled or negative cache)
