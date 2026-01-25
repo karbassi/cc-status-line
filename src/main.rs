@@ -605,29 +605,24 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Spawn background thread to refresh PR cache using native HTTP
+/// Refresh PR cache using native HTTP (synchronous)
 /// Works on all platforms, no gh CLI required
-/// All potentially blocking operations (token acquisition, HTTP) happen in the background thread
+/// Note: Runs synchronously because threads don't survive process exit.
+/// First call may be slow (~500ms), but throttling ensures subsequent calls use cache.
 fn spawn_pr_refresh_native(git_dir: &str, branch: &str) {
-    let git_dir = git_dir.to_string();
-    let branch = branch.to_string();
+    // Get owner/repo from remote URL
+    let (owner, repo) = match parse_github_remote(git_dir) {
+        Some(r) => r,
+        None => return,
+    };
 
-    // Spawn background thread - all blocking operations happen here
-    std::thread::spawn(move || {
-        // Get owner/repo from remote URL
-        let (owner, repo) = match parse_github_remote(&git_dir) {
-            Some(r) => r,
-            None => return,
-        };
+    // Get auth token (may block on git credential helper)
+    let token = match get_github_token() {
+        Some(t) => t,
+        None => return, // No auth, skip PR feature
+    };
 
-        // Get auth token (may block on git credential helper)
-        let token = match get_github_token() {
-            Some(t) => t,
-            None => return, // No auth, skip PR feature
-        };
-
-        fetch_pr_data_native(&git_dir, &branch, &owner, &repo, &token);
-    });
+    fetch_pr_data_native(git_dir, branch, &owner, &repo, &token);
 }
 
 /// Fetch PR data using native HTTP (ureq)
@@ -732,11 +727,13 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
                 };
 
                 // Build gh-compatible JSON
+                // Cap comments array size to avoid unbounded allocation
+                let comments_len = (comments_count as usize).min(10_000);
                 let gh_json = serde_json::json!({
                     "number": pr_number,
                     "state": pr["state"],
                     "url": pr_url,
-                    "comments": vec![serde_json::Value::Null; comments_count as usize],
+                    "comments": vec![serde_json::Value::Null; comments_len],
                     "changedFiles": changed_files,
                     "statusCheckRollup": check_rollup
                 });
@@ -744,12 +741,9 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
                 format!("{}\n{}\n{}", now, branch, gh_json)
             }
         }
-        Err(ureq::Error::Status(404, _)) => {
-            // Repo not found or no access - negative cache
-            format!("{}\n{}\nNO_PR", now, branch)
-        }
         Err(ureq::Error::Status(code, _)) => {
-            // API error (401 auth, 403 rate limit, etc) - don't negative cache
+            // API error (401/403/404 etc) - don't negative cache
+            // Note: 404 can mean "no access" for private repos, not just "no PR"
             format!("{}\n{}\nERROR:HTTP {}", now, branch, code)
         }
         Err(e) => {
@@ -1229,12 +1223,14 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
 
     // Comments (if any)
     if pr.comments > 0 {
-        write!(out, "{SEP}{TN_GRAY}{} comments{RESET}", pr.comments).unwrap_or_default();
+        let label = if pr.comments == 1 { "comment" } else { "comments" };
+        write!(out, "{SEP}{TN_GRAY}{} {label}{RESET}", pr.comments).unwrap_or_default();
     }
 
     // Changed files
     if pr.changed_files > 0 {
-        write!(out, "{SEP}{TN_GRAY}{} files{RESET}", pr.changed_files).unwrap_or_default();
+        let label = if pr.changed_files == 1 { "file" } else { "files" };
+        write!(out, "{SEP}{TN_GRAY}{} {label}{RESET}", pr.changed_files).unwrap_or_default();
     }
 
     // Check status (only show if we have a valid status)
