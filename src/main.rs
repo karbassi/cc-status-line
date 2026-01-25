@@ -53,6 +53,18 @@ fn get_cache_dir() -> &'static PathBuf {
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700));
+            // Security: verify the directory is owned by us (defense against pre-creation attacks)
+            // If ownership check fails, the directory may have been pre-created by an attacker
+            if let Ok(metadata) = fs::metadata(&cache_dir) {
+                use std::os::unix::fs::MetadataExt;
+                let dir_uid = metadata.uid();
+                let our_uid = unsafe { libc::getuid() };
+                if dir_uid != our_uid {
+                    // Directory not owned by us - don't use it, fall back to a safe location
+                    // In practice, this means caching is disabled for this session
+                    return PathBuf::from("/dev/null");
+                }
+            }
         }
         cache_dir
     })
@@ -476,8 +488,12 @@ fn parse_github_remote(git_dir: &str) -> Option<(String, String)> {
             in_origin_section = line == "[remote \"origin\"]";
             continue;
         }
-        if in_origin_section && line.starts_with("url = ") {
-            let url = &line[6..];
+        // Handle various whitespace: "url = ", "url= ", "url=", "\turl = ", etc.
+        if in_origin_section
+            && let Some(url) = line.strip_prefix("url")
+                .and_then(|s| s.trim_start().strip_prefix('='))
+                .map(str::trim)
+        {
             return parse_github_url(url);
         }
     }
@@ -578,7 +594,7 @@ elif [ $exit_code -ne 0 ]; then
     # Use file descriptor swap: redirect stdout to /dev/null first, then capture stderr
     err=$(gh pr view 2>&1 1>/dev/null)
     case "$err" in
-        *"no pull requests"*|*"no open pull requests"*|*"Could not resolve"*)
+        *"no pull requests"*|*"no open pull requests"*|*"Could not resolve to a PullRequest"*)
             # Legitimate "no PR" - negative cache
             printf '%s\n%s\nNO_PR' {timestamp} {branch} > {temp_cache}
             mv -f {temp_cache} {cache_path}
