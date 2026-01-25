@@ -2,6 +2,8 @@
 
 A lightweight, fast status line for Claude Code CLI.
 
+![Full status line example](docs/screenshots/16-full.png)
+
 ## Quick Start
 
 ```bash
@@ -23,13 +25,7 @@ Restart Claude Code to see the new status line.
 
 4-5 row status line with Tokyo Night colors and dot (•) dividers. PR row appears when a PR exists for the current branch.
 
-```
- trips • d/api/endpoints
- main • feature-auth • 3 files • ↑1
- #42 • open • 2 comments • 5 files • checks passed
- Opus • 84% • verbose • ◔ 35m
- 47m • resets 12m • 125K/42K
-```
+See all screenshot variations in [docs/screenshots/](docs/screenshots/).
 
 ### Row 1: Location
 - Project name (basename of where Claude launched)

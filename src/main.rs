@@ -178,53 +178,71 @@ fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct ClaudeInput {
-    #[serde(default)]
     model: Model,
-    #[serde(default)]
     context_window: ContextWindow,
-    #[serde(default)]
     cost: Cost,
-    #[serde(default)]
     output_style: OutputStyle,
-    #[serde(default)]
     workspace: Workspace,
+    git: GitInput,
+    pr: PrInput,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct Model {
-    #[serde(default)]
     display_name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct ContextWindow {
-    #[serde(default)]
     remaining_percentage: Option<f64>,
-    #[serde(default)]
     total_input_tokens: Option<u64>,
-    #[serde(default)]
     total_output_tokens: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct Cost {
-    #[serde(default)]
     total_duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct OutputStyle {
-    #[serde(default)]
     name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct Workspace {
-    #[serde(default)]
     project_dir: Option<String>,
-    #[serde(default)]
     current_dir: Option<String>,
+}
+
+/// Git info from JSON input (for screenshots/testing)
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GitInput {
+    branch: Option<String>,
+    worktree: Option<String>,
+    changed_files: Option<u32>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+}
+
+/// PR info from JSON input (for screenshots/testing)
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PrInput {
+    number: Option<u32>,
+    state: Option<String>,
+    url: Option<String>,
+    comments: Option<u32>,
+    changed_files: Option<u32>,
+    check_status: Option<String>,
 }
 
 /// Binary cache format for mmap (fixed 128 bytes)
@@ -1072,16 +1090,26 @@ fn main() {
 
     let current_dir: Cow<str> = match data.workspace.current_dir.as_deref() {
         Some(dir) => Cow::Borrowed(dir),
-        None => Cow::Owned(env::current_dir().unwrap().to_string_lossy().into_owned()),
+        None => match data.workspace.project_dir.as_deref() {
+            Some(dir) => Cow::Borrowed(dir), // Default to project_dir if current_dir not set
+            None => Cow::Owned(env::current_dir().unwrap().to_string_lossy().into_owned()),
+        },
     };
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
     write_row1(&mut out, &data, &current_dir);
-    let git_repo = get_git_repo(&current_dir);
-    write_row2(&mut out, git_repo.as_ref());
-    write_pr_rows(&mut out, git_repo.as_ref());
+
+    // Skip filesystem detection if JSON provides git.branch
+    let git_repo = if data.git.branch.is_some() {
+        None
+    } else {
+        get_git_repo(&current_dir)
+    };
+
+    write_row2(&mut out, git_repo.as_ref(), &data.git);
+    write_pr_rows(&mut out, git_repo.as_ref(), &data.pr);
     write_row3(&mut out, &data);
     write_row4(&mut out, &data);
 
@@ -1207,51 +1235,57 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     Some(GitRepo { repo, branch, worktree, git_dir, work_dir })
 }
 
-fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
-    let Some(git) = git else {
+fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>, git_input: &GitInput) {
+    // Get branch: prefer JSON input, fallback to filesystem detection
+    let branch = git_input.branch.as_deref()
+        .or_else(|| git.map(|g| g.branch.as_str()));
+
+    let Some(branch) = branch else {
         writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default();
         return;
     };
 
-    write!(out, "{TN_PURPLE}{}{RESET}", git.branch).unwrap_or_default();
+    write!(out, "{TN_PURPLE}{branch}{RESET}").unwrap_or_default();
 
-    if let Some(wt) = &git.worktree {
+    // Worktree: prefer JSON input, fallback to filesystem
+    let worktree = git_input.worktree.as_deref()
+        .or_else(|| git.and_then(|g| g.worktree.as_deref()));
+    if let Some(wt) = worktree {
         write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
     }
 
-    // Try mmap cache first
-    let cache = load_mmap_cache(&git.git_dir);
-    let current_mtime = git.index_mtime();
-    let current_oid = git.head_oid();
+    // Get stats: prefer JSON input, fallback to cache/detection
+    let (files_changed, ahead, behind) = if git_input.branch.is_some() {
+        // Using JSON input
+        (
+            git_input.changed_files.unwrap_or(0),
+            git_input.ahead.unwrap_or(0),
+            git_input.behind.unwrap_or(0),
+        )
+    } else if let Some(g) = git {
+        // Using filesystem detection
+        let cache = load_mmap_cache(&g.git_dir);
+        let current_mtime = g.index_mtime();
+        let current_oid = g.head_oid();
 
-    // Cache file stats (only depends on local state)
-    let (files_changed, lines_added, lines_deleted) =
-        if let Some(ref c) = cache {
+        let (files, _, _) = if let Some(ref c) = cache {
             if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
                 (c.files_changed, c.lines_added, c.lines_deleted)
             } else {
-                compute_and_cache_git_stats(git, current_mtime, &current_oid)
+                compute_and_cache_git_stats(g, current_mtime, &current_oid)
             }
         } else {
-            compute_and_cache_git_stats(git, current_mtime, &current_oid)
+            compute_and_cache_git_stats(g, current_mtime, &current_oid)
         };
 
-    // Always compute ahead/behind fresh (depends on upstream which can change independently)
-    let (ahead, behind) = get_ahead_behind(&git.repo, &git.branch);
+        let (a, b) = get_ahead_behind(&g.repo, &g.branch);
+        (files, a, b)
+    } else {
+        (0, 0, 0)
+    };
 
-    if files_changed > 0 || lines_added > 0 || lines_deleted > 0 {
-        write!(out, "{SEP}").unwrap_or_default();
-        if files_changed > 0 {
-            write!(out, "{TN_GRAY}{files_changed} files{RESET}").unwrap_or_default();
-        }
-        if lines_added > 0 {
-            if files_changed > 0 { write!(out, " ").unwrap_or_default(); }
-            write!(out, "{TN_GREEN}+{lines_added}{RESET}").unwrap_or_default();
-        }
-        if lines_deleted > 0 {
-            if files_changed > 0 || lines_added > 0 { write!(out, " ").unwrap_or_default(); }
-            write!(out, "{TN_RED}-{lines_deleted}{RESET}").unwrap_or_default();
-        }
+    if files_changed > 0 {
+        write!(out, "{SEP}{TN_GRAY}{files_changed} files{RESET}").unwrap_or_default();
     }
 
     if ahead > 0 || behind > 0 {
@@ -1269,20 +1303,35 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
 }
 
 /// Write PR info rows (only shown when a PR exists for current branch)
-fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
-    let Some(git) = git else { return };
-
-    let Some(pr) = get_pr_data(git) else { return };
+fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>, pr_input: &PrInput) {
+    // Get PR data: prefer JSON input, fallback to cache
+    let (number, state, url, comments, changed_files, check_status) = if let Some(n) = pr_input.number {
+        // Using JSON input
+        (
+            n,
+            pr_input.state.clone().unwrap_or_default(),
+            pr_input.url.clone().unwrap_or_default(),
+            pr_input.comments.unwrap_or(0),
+            pr_input.changed_files.unwrap_or(0),
+            pr_input.check_status.clone().unwrap_or_default(),
+        )
+    } else if let Some(g) = git {
+        // Using filesystem detection
+        let Some(pr) = get_pr_data(g) else { return };
+        (pr.number, pr.state, pr.url, pr.comments, pr.changed_files, pr.check_status)
+    } else {
+        return;
+    };
 
     // PR number (cyan, clickable via OSC 8)
-    if pr.url.is_empty() {
-        write!(out, "{TN_CYAN}#{}{RESET}", pr.number).unwrap_or_default();
+    if url.is_empty() {
+        write!(out, "{TN_CYAN}#{number}{RESET}").unwrap_or_default();
     } else {
-        write!(out, "{OSC8_START}{}{OSC8_MID}{TN_CYAN}#{}{RESET}{OSC8_END}", pr.url, pr.number).unwrap_or_default();
+        write!(out, "{OSC8_START}{url}{OSC8_MID}{TN_CYAN}#{number}{RESET}{OSC8_END}").unwrap_or_default();
     }
 
     // State with color (case-insensitive match, display lowercase)
-    let state_lower = pr.state.to_lowercase();
+    let state_lower = state.to_lowercase();
     let state_color = match state_lower.as_str() {
         "open" => TN_GREEN,
         "merged" => TN_PURPLE,
@@ -1292,32 +1341,27 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
     write!(out, "{SEP}{state_color}{state_lower}{RESET}").unwrap_or_default();
 
     // Comments (if any)
-    if pr.comments > 0 {
-        let label = if pr.comments == 1 { "comment" } else { "comments" };
-        write!(out, "{SEP}{TN_GRAY}{} {label}{RESET}", pr.comments).unwrap_or_default();
+    if comments > 0 {
+        let label = if comments == 1 { "comment" } else { "comments" };
+        write!(out, "{SEP}{TN_GRAY}{comments} {label}{RESET}").unwrap_or_default();
     }
 
     // Changed files
-    if pr.changed_files > 0 {
-        let label = if pr.changed_files == 1 { "file" } else { "files" };
-        write!(out, "{SEP}{TN_GRAY}{} {label}{RESET}", pr.changed_files).unwrap_or_default();
+    if changed_files > 0 {
+        let label = if changed_files == 1 { "file" } else { "files" };
+        write!(out, "{SEP}{TN_GRAY}{changed_files} {label}{RESET}").unwrap_or_default();
     }
 
     // Check status (only show if we have a valid status)
-    // Link to checks page: {pr_url}/checks
-    let checks_url = if pr.url.is_empty() {
-        String::new()
-    } else {
-        format!("{}/checks", pr.url)
-    };
-    match pr.check_status.trim() {
+    let checks_url = if url.is_empty() { String::new() } else { format!("{url}/checks") };
+    match check_status.trim() {
         "passed" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_GREEN}checks passed{RESET}{OSC8_END}").unwrap_or_default(),
         "failed" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_RED}checks failed{RESET}{OSC8_END}").unwrap_or_default(),
         "pending" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_ORANGE}checks pending{RESET}{OSC8_END}").unwrap_or_default(),
         "passed" => write!(out, "{SEP}{TN_GREEN}checks passed{RESET}").unwrap_or_default(),
         "failed" => write!(out, "{SEP}{TN_RED}checks failed{RESET}").unwrap_or_default(),
         "pending" => write!(out, "{SEP}{TN_ORANGE}checks pending{RESET}").unwrap_or_default(),
-        _ => {} // No checks or unknown status - show nothing
+        _ => {}
     }
 
     writeln!(out).unwrap_or_default();
