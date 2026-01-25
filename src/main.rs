@@ -605,11 +605,31 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Percent-encode a string for use in URLs
+/// Encodes characters that are not unreserved per RFC 3986
+fn percent_encode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            // Unreserved characters (RFC 3986): ALPHA / DIGIT / "-" / "." / "_" / "~"
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                result.push(byte as char);
+            }
+            // Everything else gets percent-encoded
+            _ => {
+                result.push('%');
+                result.push_str(&format!("{:02X}", byte));
+            }
+        }
+    }
+    result
+}
+
 /// Refresh PR cache using native HTTP (synchronous)
 /// Works on all platforms, no gh CLI required
 /// Note: Runs synchronously because threads don't survive process exit.
 /// First call may be slow (~500ms), but throttling ensures subsequent calls use cache.
-fn spawn_pr_refresh_native(git_dir: &str, branch: &str) {
+fn refresh_pr_native(git_dir: &str, branch: &str) {
     // Get owner/repo from remote URL
     let (owner, repo) = match parse_github_remote(git_dir) {
         Some(r) => r,
@@ -636,9 +656,11 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
     // GitHub API: GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=all
     // Use state=all to show merged/closed PRs too (not just open)
+    // URL-encode the branch name to handle special characters like # or spaces
+    let encoded_branch = percent_encode(branch);
     let url = format!(
         "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=all",
-        owner, repo, owner, branch
+        owner, repo, owner, encoded_branch
     );
 
     let response = ureq::get(&url)
@@ -775,7 +797,7 @@ fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
     }
 
     // Fallback to native HTTP (works on all platforms, no gh required)
-    spawn_pr_refresh_native(git_dir, branch);
+    refresh_pr_native(git_dir, branch);
 }
 
 /// Check if we should skip refresh (throttled or negative cache)
