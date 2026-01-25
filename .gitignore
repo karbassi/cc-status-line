@@ -14,5 +14,4 @@ target/
 *.pdb
 
 # Claude Code
-/.claude/*
-!/.claude/settings.json
+/.claude/

@@ -48,6 +48,15 @@ Restart Claude Code to see the new status line.
 - Changed files count
 - Check status: passed/failed/pending (clickable link to checks page)
 
+**Requirements for PR row:**
+- GitHub repository with origin remote
+- Authentication via one of:
+  - `GITHUB_TOKEN` or `GH_TOKEN` environment variable
+  - GitHub CLI (`gh auth login`)
+  - Git credential helper with GitHub credentials
+
+If no authentication is available, the PR row will not appear.
+
 ### Row 4: Claude
 - Model (Opus/Sonnet/Haiku)
 - Context % remaining

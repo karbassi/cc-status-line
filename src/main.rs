@@ -1305,6 +1305,10 @@ fn get_ahead_behind(repo: &gix::Repository, branch: &str) -> (u32, u32) {
 }
 
 /// Count commits reachable from `from` but not from `exclude`
+///
+/// Note: Uses a 10k commit safety limit to prevent runaway computation in very large repos.
+/// In repos with >10k commits between branches, counts may be approximate. This is an
+/// intentional trade-off for predictable performance in a status line tool.
 fn count_commits_not_in(repo: &gix::Repository, from: gix::ObjectId, exclude: gix::ObjectId) -> u32 {
     // First, collect all commits reachable from exclude (the "stop" set)
     let mut exclude_set = std::collections::HashSet::new();
