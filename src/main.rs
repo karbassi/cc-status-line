@@ -27,9 +27,8 @@ fn get_home() -> &'static str {
 /// Uses $XDG_CACHE_HOME/cc-statusline or ~/.cache/cc-statusline
 fn get_cache_dir() -> &'static PathBuf {
     CACHE_DIR.get_or_init(|| {
-        let base = env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
+        let base = env::var("XDG_CACHE_HOME").map_or_else(
+            |_| {
                 let home = get_home();
                 if home.is_empty() {
                     // Fallback to system temp dir with user-specific subdirectory
@@ -39,12 +38,14 @@ fn get_cache_dir() -> &'static PathBuf {
                     let uid = unsafe { libc::getuid() };
                     #[cfg(not(unix))]
                     let uid = std::process::id();
-                    base.push(format!("cc-statusline-{}", uid));
+                    base.push(format!("cc-statusline-{uid}"));
                     base
                 } else {
                     PathBuf::from(home).join(".cache")
                 }
-            });
+            },
+            PathBuf::from,
+        );
         let cache_dir = base.join("cc-statusline");
         // Create directory with restricted permissions (0700)
         let _ = fs::create_dir_all(&cache_dir);
@@ -71,7 +72,7 @@ fn is_gh_available() -> bool {
 }
 
 /// Get GitHub token for API authentication
-/// Tries: 1) GITHUB_TOKEN env var, 2) GH_TOKEN env var, 3) git credential fill
+/// Tries: 1) `GITHUB_TOKEN` env var, 2) `GH_TOKEN` env var, 3) git credential fill
 fn get_github_token() -> Option<String> {
     // Try GITHUB_TOKEN env first
     if let Ok(token) = env::var("GITHUB_TOKEN")
@@ -136,7 +137,7 @@ const OSC8_END: &str = "\x1b]8;;\x07";
 const TERM_WIDTH: usize = 50;
 
 fn hash_path(path: &str) -> u64 {
-    path.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+    path.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
 }
 
 /// Atomic rename that works on Windows (removes destination first if it exists)
@@ -313,21 +314,20 @@ enum PrCacheResult {
 }
 
 fn get_pr_cache_path(repo_path: &str, branch: &str) -> PathBuf {
-    let key = format!("{}:{}", repo_path, branch);
+    let key = format!("{repo_path}:{branch}");
     get_cache_dir().join(format!("pr-{:016x}.cache", hash_path(&key)))
 }
 
 fn get_pr_attempt_path(repo_path: &str, branch: &str) -> PathBuf {
-    let key = format!("{}:{}", repo_path, branch);
+    let key = format!("{repo_path}:{branch}");
     get_cache_dir().join(format!("pr-attempt-{:016x}", hash_path(&key)))
 }
 
 /// Load PR cache - reads file once and handles all states
 fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
     let cache_path = get_pr_cache_path(repo_path, branch);
-    let content = match fs::read_to_string(&cache_path) {
-        Ok(c) => c,
-        Err(_) => return PrCacheResult::Stale,
+    let Ok(content) = fs::read_to_string(&cache_path) else {
+        return PrCacheResult::Stale;
     };
 
     // Cache file format:
@@ -339,9 +339,8 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         Some(t) => t,
         None => return PrCacheResult::Stale,
     };
-    let cached_branch = match lines.next() {
-        Some(b) => b,
-        None => return PrCacheResult::Stale,
+    let Some(cached_branch) = lines.next() else {
+        return PrCacheResult::Stale;
     };
 
     // Validate branch matches
@@ -363,9 +362,8 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
     if json_str == "NO_PR" {
         if age < PR_NEGATIVE_CACHE_TTL {
             return PrCacheResult::NoPr;
-        } else {
-            return PrCacheResult::Stale;
         }
+        return PrCacheResult::Stale;
     }
 
     // Handle ERROR marker - don't cache errors, always retry
@@ -423,11 +421,12 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         }
     };
 
+    #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
     PrCacheResult::Hit(PrCacheData {
         number: pr.number.unwrap_or(0) as u32,
         state: pr.state.unwrap_or_default(),
         url: pr.url.unwrap_or_default(),
-        comments: pr.comments.map(|c| c.len() as u32).unwrap_or(0),
+        comments: pr.comments.map_or(0, |c| c.len() as u32),
         changed_files: pr.changed_files.unwrap_or(0) as u32,
         check_status,
     })
@@ -438,13 +437,11 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
 // ============================================================================
 
 /// Check if remote is GitHub
-/// Uses gix common_dir() for worktree support
+/// Uses gix `common_dir()` for worktree support
 fn is_github_remote(git_dir: &str) -> bool {
     // Use gix to get the common dir (handles worktrees automatically)
     let common_dir = gix::open(git_dir)
-        .ok()
-        .map(|repo| repo.common_dir().to_path_buf())
-        .unwrap_or_else(|| Path::new(git_dir).to_path_buf());
+        .ok().map_or_else(|| Path::new(git_dir).to_path_buf(), |repo| repo.common_dir().to_path_buf());
 
     let config_path = common_dir.join("config");
     if let Ok(content) = fs::read_to_string(&config_path) {
@@ -454,13 +451,11 @@ fn is_github_remote(git_dir: &str) -> bool {
 }
 
 /// Parse GitHub owner/repo from git remote URL
-/// Handles: git@github.com:owner/repo.git, https://github.com/owner/repo.git
+/// Handles: git@github.com:owner/repo.git, <https://github.com/owner/repo.git>
 fn parse_github_remote(git_dir: &str) -> Option<(String, String)> {
     // Use gix to get the common dir (handles worktrees automatically)
     let common_dir = gix::open(git_dir)
-        .ok()
-        .map(|repo| repo.common_dir().to_path_buf())
-        .unwrap_or_else(|| Path::new(git_dir).to_path_buf());
+        .ok().map_or_else(|| Path::new(git_dir).to_path_buf(), |repo| repo.common_dir().to_path_buf());
 
     let config_path = common_dir.join("config");
     let content = fs::read_to_string(&config_path).ok()?;
@@ -517,7 +512,7 @@ fn random_hex() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    format!("{:016x}{:08x}", nanos, pid)
+    format!("{nanos:016x}{pid:08x}")
 }
 
 /// Spawn background process to refresh PR cache using gh CLI
@@ -536,9 +531,9 @@ fn spawn_pr_refresh_gh(git_dir: &str, work_dir: &str, branch: &str) {
 
     // Create temp files with random suffix in secure cache directory
     let random_suffix = random_hex();
-    let temp_cache = get_cache_dir().join(format!("pr-tmp-{}.cache", random_suffix));
+    let temp_cache = get_cache_dir().join(format!("pr-tmp-{random_suffix}.cache"));
     let temp_cache_str = temp_cache.to_string_lossy();
-    let script_path = get_cache_dir().join(format!("pr-refresh-{}.sh", random_suffix));
+    let script_path = get_cache_dir().join(format!("pr-refresh-{random_suffix}.sh"));
 
     // Script logic:
     // 1. Run gh pr view and capture stdout/stderr separately
@@ -610,6 +605,7 @@ fn shell_escape(s: &str) -> String {
 /// Percent-encode a string for use in URLs
 /// Encodes characters that are not unreserved per RFC 3986
 fn percent_encode(s: &str) -> String {
+    use std::fmt::Write;
     let mut result = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {
@@ -620,7 +616,7 @@ fn percent_encode(s: &str) -> String {
             // Everything else gets percent-encoded
             _ => {
                 result.push('%');
-                result.push_str(&format!("{:02X}", byte));
+                let _ = write!(result, "{byte:02X}");
             }
         }
     }
@@ -633,21 +629,20 @@ fn percent_encode(s: &str) -> String {
 /// First call may be slow (~500ms), but throttling ensures subsequent calls use cache.
 fn refresh_pr_native(git_dir: &str, branch: &str) {
     // Get owner/repo from remote URL
-    let (owner, repo) = match parse_github_remote(git_dir) {
-        Some(r) => r,
-        None => return,
+    let Some((owner, repo)) = parse_github_remote(git_dir) else {
+        return;
     };
 
     // Get auth token (may block on git credential helper)
-    let token = match get_github_token() {
-        Some(t) => t,
-        None => return, // No auth, skip PR feature
+    let Some(token) = get_github_token() else {
+        return; // No auth, skip PR feature
     };
 
     fetch_pr_data_native(git_dir, branch, &owner, &repo, &token);
 }
 
 /// Fetch PR data using native HTTP (ureq)
+#[allow(clippy::too_many_lines)]
 fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, token: &str) {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -661,12 +656,11 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
     // URL-encode the branch name to handle special characters like # or spaces
     let encoded_branch = percent_encode(branch);
     let url = format!(
-        "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=all",
-        owner, repo, owner, encoded_branch
+        "https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{encoded_branch}&state=all"
     );
 
     let response = ureq::get(&url)
-        .set("Authorization", &format!("Bearer {}", token))
+        .set("Authorization", &format!("Bearer {token}"))
         .set("Accept", "application/vnd.github+json")
         .set("User-Agent", "cc-statusline")
         .set("X-GitHub-Api-Version", "2022-11-28")
@@ -674,9 +668,8 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
     let cache_content = match response {
         Ok(resp) => {
-            let body = match resp.into_string() {
-                Ok(b) => b,
-                Err(_) => return,
+            let Ok(body) = resp.into_string() else {
+                return;
             };
 
             // Parse as array of PRs
@@ -687,7 +680,7 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
             if prs.is_empty() {
                 // No PR for this branch - negative cache
-                format!("{}\n{}\nNO_PR", now, branch)
+                format!("{now}\n{branch}\nNO_PR")
             } else {
                 // Found PR - convert to gh-compatible format
                 let pr = &prs[0];
@@ -696,11 +689,10 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
                 // Fetch additional PR details (comments, check status)
                 let detail_url = format!(
-                    "https://api.github.com/repos/{}/{}/pulls/{}",
-                    owner, repo, pr_number
+                    "https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
                 );
                 let detail_resp = ureq::get(&detail_url)
-                    .set("Authorization", &format!("Bearer {}", token))
+                    .set("Authorization", &format!("Bearer {token}"))
                     .set("Accept", "application/vnd.github+json")
                     .set("User-Agent", "cc-statusline")
                     .set("X-GitHub-Api-Version", "2022-11-28")
@@ -725,7 +717,7 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
                     owner, repo, pr["head"]["sha"].as_str().unwrap_or("")
                 );
                 let checks_resp = ureq::get(&checks_url)
-                    .set("Authorization", &format!("Bearer {}", token))
+                    .set("Authorization", &format!("Bearer {token}"))
                     .set("Accept", "application/vnd.github+json")
                     .set("User-Agent", "cc-statusline")
                     .set("X-GitHub-Api-Version", "2022-11-28")
@@ -753,6 +745,7 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
                 // Build gh-compatible JSON
                 // Cap comments array size to avoid unbounded allocation
+                #[allow(clippy::cast_possible_truncation)]
                 let comments_len = (comments_count as usize).min(10_000);
                 let gh_json = serde_json::json!({
                     "number": pr_number,
@@ -763,17 +756,17 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
                     "statusCheckRollup": check_rollup
                 });
 
-                format!("{}\n{}\n{}", now, branch, gh_json)
+                format!("{now}\n{branch}\n{gh_json}")
             }
         }
         Err(ureq::Error::Status(code, _)) => {
             // API error (401/403/404 etc) - don't negative cache
             // Note: 404 can mean "no access" for private repos, not just "no PR"
-            format!("{}\n{}\nERROR:HTTP {}", now, branch, code)
+            format!("{now}\n{branch}\nERROR:HTTP {code}")
         }
         Err(e) => {
             // Network error - don't negative cache
-            format!("{}\n{}\nERROR:{}", now, branch, e)
+            format!("{now}\n{branch}\nERROR:{e}")
         }
     };
 
@@ -878,7 +871,7 @@ impl GitRepo {
                 let mtime = metadata.modified().ok()?
                     .duration_since(SystemTime::UNIX_EPOCH).ok()?
                     .as_secs();
-                let index_mtime = entry.stat.mtime.secs as u64;
+                let index_mtime = u64::from(entry.stat.mtime.secs);
 
                 if mtime != index_mtime {
                     files += 1;
@@ -929,23 +922,19 @@ fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
     // Atomic write: write to temp file, then rename
     let temp_path = get_cache_dir().join(format!("status-tmp-{}.cache", random_hex()));
 
-    let file = match OpenOptions::new()
+    let Ok(file) = OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
         .open(&temp_path)
-    {
-        Ok(f) => f,
-        Err(_) => return,
+    else {
+        return;
     };
     if file.set_len(CACHE_SIZE as u64).is_err() {
         let _ = fs::remove_file(&temp_path);
         return;
     }
-    let mut mmap = match unsafe { MmapMut::map_mut(&file) } {
-        Ok(m) => m,
-        Err(_) => {
-            let _ = fs::remove_file(&temp_path);
-            return;
-        }
+    let Ok(mut mmap) = (unsafe { MmapMut::map_mut(&file) }) else {
+        let _ = fs::remove_file(&temp_path);
+        return;
     };
     cache.to_bytes(&mut mmap);
     if mmap.flush().is_err() {
@@ -995,7 +984,7 @@ fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
 fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
     let cache_path = get_cache_dir().join(format!("gitpath-{:016x}.cache", hash_path(working_dir)));
     let head_mtime = get_head_mtime(git_path);
-    let content = format!("{}\n{}\n{}", git_path, branch, head_mtime);
+    let content = format!("{git_path}\n{branch}\n{head_mtime}");
     // Atomic write (Windows-compatible): write to temp, then rename
     let temp_path = get_cache_dir().join(format!("gitpath-tmp-{}.cache", random_hex()));
     if fs::write(&temp_path, &content).is_ok() {
@@ -1103,7 +1092,7 @@ fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
-/// Detect linked worktree name from git_dir path
+/// Detect linked worktree name from `git_dir` path
 fn get_worktree_name(git_dir: &str) -> Option<String> {
     // Linked worktrees have git_dir like: /path/.git/worktrees/<name>
     if let Some(idx) = git_dir.find("/.git/worktrees/") {
@@ -1120,9 +1109,7 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     // Try cache first
     if let Some(cache) = get_cached_git_info(dir) {
         let repo = gix::open(&cache.git_path).ok()?;
-        let work_dir = repo.work_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dir.to_string());
+        let work_dir = repo.work_dir().map_or_else(|| dir.to_string(), |p| p.to_string_lossy().into_owned());
         let worktree = get_worktree_name(&cache.git_path);
         return Some(GitRepo {
             repo,
@@ -1136,15 +1123,11 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
     // Discover repo
     let repo = gix::discover(dir).ok()?;
     let git_dir = repo.git_dir().to_string_lossy().into_owned();
-    let work_dir = repo.work_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.to_string());
+    let work_dir = repo.work_dir().map_or_else(|| dir.to_string(), |p| p.to_string_lossy().into_owned());
 
     // Get branch name from HEAD
     let head = repo.head().ok()?;
-    let branch = head.referent_name()
-        .map(|n| n.shorten().to_string())
-        .unwrap_or_else(|| "HEAD".to_string());
+    let branch = head.referent_name().map_or_else(|| "HEAD".to_string(), |n| n.shorten().to_string());
 
     let worktree = get_worktree_name(&git_dir);
 
@@ -1153,12 +1136,9 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
 }
 
 fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
-    let git = match git {
-        None => {
-            writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default();
-            return;
-        }
-        Some(g) => g,
+    let Some(git) = git else {
+        writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default();
+        return;
     };
 
     write!(out, "{TN_PURPLE}{}{RESET}", git.branch).unwrap_or_default();
@@ -1218,21 +1198,15 @@ fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>) {
 
 /// Write PR info rows (only shown when a PR exists for current branch)
 fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
-    let git = match git {
-        None => return,
-        Some(g) => g,
-    };
+    let Some(git) = git else { return };
 
-    let pr = match get_pr_data(git) {
-        None => return,
-        Some(p) => p,
-    };
+    let Some(pr) = get_pr_data(git) else { return };
 
     // PR number (cyan, clickable via OSC 8)
-    if !pr.url.is_empty() {
-        write!(out, "{OSC8_START}{}{OSC8_MID}{TN_CYAN}#{}{RESET}{OSC8_END}", pr.url, pr.number).unwrap_or_default();
-    } else {
+    if pr.url.is_empty() {
         write!(out, "{TN_CYAN}#{}{RESET}", pr.number).unwrap_or_default();
+    } else {
+        write!(out, "{OSC8_START}{}{OSC8_MID}{TN_CYAN}#{}{RESET}{OSC8_END}", pr.url, pr.number).unwrap_or_default();
     }
 
     // State with color (case-insensitive match, display lowercase)
@@ -1243,7 +1217,7 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
         "closed" => TN_RED,
         _ => TN_GRAY,
     };
-    write!(out, "{SEP}{state_color}{}{RESET}", state_lower).unwrap_or_default();
+    write!(out, "{SEP}{state_color}{state_lower}{RESET}").unwrap_or_default();
 
     // Comments (if any)
     if pr.comments > 0 {
@@ -1259,10 +1233,10 @@ fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>) {
 
     // Check status (only show if we have a valid status)
     // Link to checks page: {pr_url}/checks
-    let checks_url = if !pr.url.is_empty() {
-        format!("{}/checks", pr.url)
-    } else {
+    let checks_url = if pr.url.is_empty() {
         String::new()
+    } else {
+        format!("{}/checks", pr.url)
     };
     match pr.check_status.trim() {
         "passed" if !checks_url.is_empty() => write!(out, "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_GREEN}checks passed{RESET}{OSC8_END}").unwrap_or_default(),
@@ -1283,32 +1257,31 @@ fn find_upstream_ref(repo: &gix::Repository, branch: &str) -> Option<String> {
     let config = repo.config_snapshot();
 
     // Get branch.<name>.remote (e.g., "origin")
-    let remote_key = format!("branch.{}.remote", branch);
+    let remote_key = format!("branch.{branch}.remote");
     let remote = config.string(remote_key.as_str())?;
     let remote = remote.to_string();
 
     // Get branch.<name>.merge (e.g., "refs/heads/main")
-    let merge_key = format!("branch.{}.merge", branch);
+    let merge_key = format!("branch.{branch}.merge");
     let merge_ref = config.string(merge_key.as_str())?;
     let merge_ref = merge_ref.to_string();
 
     // Convert refs/heads/X to refs/remotes/<remote>/X
     let upstream_branch = merge_ref.strip_prefix("refs/heads/")?;
-    Some(format!("refs/remotes/{}/{}", remote, upstream_branch))
+    Some(format!("refs/remotes/{remote}/{upstream_branch}"))
 }
 
 /// Get ahead/behind counts relative to upstream using gix
 fn get_ahead_behind(repo: &gix::Repository, branch: &str) -> (u32, u32) {
     // Get HEAD commit
-    let head_id = match repo.head_id() {
-        Ok(id) => id,
-        Err(_) => return (0, 0),
+    let Ok(head_id) = repo.head_id() else {
+        return (0, 0);
     };
 
     // Try to find configured upstream for this branch first
     // Falls back to origin/<branch> if no upstream configured
     let upstream_ref = find_upstream_ref(repo, branch)
-        .unwrap_or_else(|| format!("refs/remotes/origin/{}", branch));
+        .unwrap_or_else(|| format!("refs/remotes/origin/{branch}"));
 
     let upstream_id = match repo.find_reference(&upstream_ref) {
         Ok(r) => match r.into_fully_peeled_id() {
@@ -1402,6 +1375,7 @@ fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
         has_content = true;
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let context_pct = data.context_window.remaining_percentage.unwrap_or(100.0) as u32;
     if context_pct < 100 {
         if has_content { write!(out, "{SEP}").unwrap_or_default(); }
@@ -1433,9 +1407,9 @@ fn write_row4<W: Write>(out: &mut W, data: &ClaudeInput) {
         let mins = mins % 60;
 
         if hours > 0 {
-            write!(out, "{TN_GRAY}{}h {}m{RESET}", hours, mins).unwrap_or_default();
+            write!(out, "{TN_GRAY}{hours}h {mins}m{RESET}").unwrap_or_default();
         } else {
-            write!(out, "{TN_GRAY}{}m{RESET}", mins).unwrap_or_default();
+            write!(out, "{TN_GRAY}{mins}m{RESET}").unwrap_or_default();
         }
         has_content = true;
     }
@@ -1462,10 +1436,10 @@ fn write_tokens<W: Write>(out: &mut W, n: u64) {
         let tenths = n / 100_000;
         let whole = tenths / 10;
         let frac = tenths % 10;
-        let _ = write!(out, "{}.{}M", whole, frac);
+        let _ = write!(out, "{whole}.{frac}M");
     } else if n >= 1_000 {
         let _ = write!(out, "{}K", n / 1_000);
     } else {
-        let _ = write!(out, "{}", n);
+        let _ = write!(out, "{n}");
     }
 }
