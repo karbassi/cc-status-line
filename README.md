@@ -90,7 +90,7 @@ If no authentication is available, the PR row will not appear. On Windows, use a
 | Bash | 80 ms | 59 ms |
 | Rust | 3.7 ms | 3.0 ms |
 
-**20x faster than bash.** Binary <1MB, ~1.4MB RAM.
+**20x faster than bash.** Binary ~2MB, ~1.4MB RAM.
 
 Optimizations:
 - gix (pure Rust git, minimal features)
