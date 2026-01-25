@@ -25,7 +25,7 @@ Restart Claude Code to see the new status line.
 
 ```
  trips • d/api/endpoints
- main • feature-auth • +3 ~2 • ↑1
+ main • feature-auth • 3 files +45 -12 • ↑1
  #42 • open • 2 comments • 5 files • checks passed
  Opus • 84% • verbose • ◔ 35m
  47m • resets 12m • 125K/42K
@@ -38,7 +38,7 @@ Restart Claude Code to see the new status line.
 ### Row 2: Git
 - Branch name
 - Worktree name (if active)
-- Status: `+N` added, `~N` modified, `-N` deleted, `?N` untracked
+- Changed files count, lines added (`+N`), lines deleted (`-N`)
 - Remote: `↑N` ahead, `↓N` behind
 
 ### Row 3: PR (optional, GitHub only)

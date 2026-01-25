@@ -71,7 +71,7 @@ fn is_gh_available() -> bool {
 }
 
 /// Get GitHub token for API authentication
-/// Tries: 1) GITHUB_TOKEN env var, 2) git credential fill
+/// Tries: 1) GITHUB_TOKEN env var, 2) GH_TOKEN env var, 3) git credential fill
 fn get_github_token() -> Option<String> {
     // Try GITHUB_TOKEN env first
     if let Ok(token) = env::var("GITHUB_TOKEN") {
@@ -383,24 +383,30 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
     };
 
     // Compute check status from rollup
+    // Note: gh CLI returns uppercase (SUCCESS), REST API returns lowercase (success)
     let check_status = match &pr.status_check_rollup {
         None => String::new(),
         Some(checks) if checks.is_empty() => String::new(),
         Some(checks) => {
+            // Case-insensitive check for passing conclusions
+            let is_passing = |s: &str| {
+                matches!(s.to_ascii_uppercase().as_str(), "SUCCESS" | "SKIPPED" | "NEUTRAL")
+            };
+
             // Treat any non-success conclusion as a failure
             let has_failure = checks.iter().any(|c| {
                 match c.conclusion.as_deref() {
-                    Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL") => false,
+                    Some(conc) if is_passing(conc) => false,
                     Some(_) => true, // FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, etc.
                     None => false,
                 }
             });
             let has_pending = checks.iter().any(|c| c.conclusion.is_none());
             let all_passed = checks.iter().all(|c| {
-                matches!(
-                    c.conclusion.as_deref(),
-                    Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
-                )
+                match c.conclusion.as_deref() {
+                    Some(conc) => is_passing(conc),
+                    None => false,
+                }
             });
 
             if has_failure {
@@ -601,24 +607,25 @@ fn shell_escape(s: &str) -> String {
 
 /// Spawn background thread to refresh PR cache using native HTTP
 /// Works on all platforms, no gh CLI required
+/// All potentially blocking operations (token acquisition, HTTP) happen in the background thread
 fn spawn_pr_refresh_native(git_dir: &str, branch: &str) {
-    // Get owner/repo from remote URL
-    let (owner, repo) = match parse_github_remote(git_dir) {
-        Some(r) => r,
-        None => return,
-    };
-
-    // Get auth token (required for API access)
-    let token = match get_github_token() {
-        Some(t) => t,
-        None => return, // No auth, skip PR feature
-    };
-
     let git_dir = git_dir.to_string();
     let branch = branch.to_string();
 
-    // Spawn background thread for HTTP call
+    // Spawn background thread - all blocking operations happen here
     std::thread::spawn(move || {
+        // Get owner/repo from remote URL
+        let (owner, repo) = match parse_github_remote(&git_dir) {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Get auth token (may block on git credential helper)
+        let token = match get_github_token() {
+            Some(t) => t,
+            None => return, // No auth, skip PR feature
+        };
+
         fetch_pr_data_native(&git_dir, &branch, &owner, &repo, &token);
     });
 }
