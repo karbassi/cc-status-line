@@ -284,13 +284,18 @@ struct PrCacheData {
     check_status: String, // "passed", "failed", "pending", ""
 }
 
-/// JSON structure from gh pr view
+/// JSON structure from gh pr view (or native API cache)
+/// Supports both gh CLI format (comments as array) and native format (commentsCount as number)
 #[derive(Deserialize, Default)]
 struct GhPrJson {
     number: Option<u64>,
     state: Option<String>,
     url: Option<String>,
+    /// gh CLI returns array, native API stores count directly
     comments: Option<Vec<serde_json::Value>>,
+    /// Native API stores count directly (preferred, avoids large array allocation)
+    #[serde(rename = "commentsCount")]
+    comments_count: Option<u64>,
     #[serde(rename = "changedFiles")]
     changed_files: Option<u64>,
     #[serde(rename = "statusCheckRollup")]
@@ -421,12 +426,19 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         }
     };
 
+    // Prefer commentsCount (numeric) over comments array to avoid large allocations
+    #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
+    let comments = pr.comments_count
+        .map(|c| c as u32)
+        .or_else(|| pr.comments.map(|c| c.len() as u32))
+        .unwrap_or(0);
+
     #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
     PrCacheResult::Hit(PrCacheData {
         number: pr.number.unwrap_or(0) as u32,
         state: pr.state.unwrap_or_default(),
         url: pr.url.unwrap_or_default(),
-        comments: pr.comments.map_or(0, |c| c.len() as u32),
+        comments,
         changed_files: pr.changed_files.unwrap_or(0) as u32,
         check_status,
     })
@@ -743,15 +755,13 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
                     Err(_) => vec![],
                 };
 
-                // Build gh-compatible JSON
-                // Cap comments array size to avoid unbounded allocation
-                #[allow(clippy::cast_possible_truncation)]
-                let comments_len = (comments_count as usize).min(10_000);
+                // Build cache JSON - use commentsCount (number) instead of comments array
+                // to avoid large allocations when deserializing
                 let gh_json = serde_json::json!({
                     "number": pr_number,
                     "state": pr["state"],
                     "url": pr_url,
-                    "comments": vec![serde_json::Value::Null; comments_len],
+                    "commentsCount": comments_count,
                     "changedFiles": changed_files,
                     "statusCheckRollup": check_rollup
                 });
@@ -778,21 +788,23 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 }
 
 /// Dispatch PR refresh to appropriate implementation
-fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) {
+/// Returns true if refresh was synchronous (cache can be re-read immediately)
+fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) -> bool {
     // Only proceed if this is a GitHub repo
     if !is_github_remote(git_dir) {
-        return;
+        return false;
     }
 
     // On Unix, prefer gh if available (handles auth, rate limits better)
     #[cfg(unix)]
     if is_gh_available() {
         spawn_pr_refresh_gh(git_dir, work_dir, branch);
-        return;
+        return false; // Background process, cache not ready yet
     }
 
     // Fallback to native HTTP (works on all platforms, no gh required)
     refresh_pr_native(git_dir, branch);
+    true // Synchronous, cache is ready
 }
 
 /// Check if we should skip refresh (throttled or negative cache)
@@ -839,9 +851,16 @@ fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
     // Mark that we're attempting a refresh
     mark_refresh_attempt(&git.git_dir, &git.branch);
 
-    // Cache miss or stale - spawn background refresh only
-    // Don't block - return None and let the next render show PR data
-    spawn_pr_refresh(&git.git_dir, &git.work_dir, &git.branch);
+    // Trigger refresh - returns true if synchronous (native path)
+    let was_synchronous = spawn_pr_refresh(&git.git_dir, &git.work_dir, &git.branch);
+
+    // If refresh was synchronous, re-read cache to return data immediately
+    // This avoids blocking on HTTP but still not showing PR data until next render
+    if was_synchronous
+        && let PrCacheResult::Hit(data) = load_pr_cache(&git.git_dir, &git.branch)
+    {
+        return Some(data);
+    }
 
     None
 }
