@@ -72,7 +72,6 @@ dependencies = [
 name = "cc-statusline"
 version = "0.1.2"
 dependencies = [
- "filetime",
  "gix",
  "libc",
  "memmap2",
