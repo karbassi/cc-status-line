@@ -1,3 +1,4 @@
+use cc_statusline::{abbreviate_path, hash_path, parse_github_url, percent_encode, shell_escape};
 use gix::Repository;
 use memmap2::{MmapMut, MmapOptions};
 use serde::Deserialize;
@@ -160,12 +161,6 @@ const OSC8_MID: &str = "\x07";
 const OSC8_END: &str = "\x1b]8;;\x07";
 
 const TERM_WIDTH: usize = 50;
-
-fn hash_path(path: &str) -> u64 {
-    path.bytes().fold(0u64, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(u64::from(b))
-    })
-}
 
 /// Best-effort cross-platform rename that overwrites the destination.
 ///
@@ -555,40 +550,6 @@ fn parse_github_remote(git_dir: &str) -> Option<(String, String)> {
     None
 }
 
-/// Parse owner/repo from a GitHub URL
-/// Validates the host is exactly `github.com` to avoid false positives
-fn parse_github_url(url: &str) -> Option<(String, String)> {
-    // SSH format: git@github.com:owner/repo.git (exact prefix match)
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let path = rest.trim_end_matches(".git");
-        let mut parts = path.splitn(2, '/');
-        let owner = parts.next()?.to_string();
-        let repo = parts.next()?.to_string();
-        if !owner.is_empty() && !repo.is_empty() {
-            return Some((owner, repo));
-        }
-    }
-
-    // HTTPS format: https://github.com/owner/repo.git
-    // Validate host is exactly github.com (not notgithub.com, etc.)
-    let url_lower = url.to_lowercase();
-    if url_lower.starts_with("https://github.com/") || url_lower.starts_with("http://github.com/") {
-        let proto_end = url.find("://")? + 3;
-        let path_start = proto_end + "github.com/".len();
-        if url.len() > path_start {
-            let path = url[path_start..].trim_end_matches(".git");
-            let mut parts = path.splitn(2, '/');
-            let owner = parts.next()?.to_string();
-            let repo = parts.next()?.to_string();
-            if !owner.is_empty() && !repo.is_empty() {
-                return Some((owner, repo));
-            }
-        }
-    }
-
-    None
-}
-
 /// Generate a unique hex string for temp file names
 /// Uses timestamp + pid + atomic counter to avoid collisions within same process
 fn unique_hex() -> String {
@@ -685,32 +646,6 @@ fi
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-/// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Percent-encode a string for use in URLs
-/// Encodes characters that are not unreserved per RFC 3986
-fn percent_encode(s: &str) -> String {
-    use std::fmt::Write;
-    let mut result = String::with_capacity(s.len() * 3);
-    for byte in s.bytes() {
-        match byte {
-            // Unreserved characters (RFC 3986): ALPHA / DIGIT / "-" / "." / "_" / "~"
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                result.push(byte as char);
-            }
-            // Everything else gets percent-encoded
-            _ => {
-                result.push('%');
-                let _ = write!(result, "{byte:02X}");
-            }
-        }
-    }
-    result
 }
 
 /// Refresh PR cache using native HTTP (synchronous)
@@ -1170,60 +1105,6 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
         "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
     )
     .unwrap_or_default();
-}
-
-fn abbreviate_path(path: &str, max_width: usize) -> Cow<'_, str> {
-    if path.len() <= max_width {
-        return Cow::Borrowed(path);
-    }
-
-    let bytes = path.as_bytes();
-    let mut seg_starts: [usize; 32] = [0; 32];
-    let mut seg_count = 1;
-    seg_starts[0] = 0;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'/' && seg_count < 32 {
-            seg_starts[seg_count] = i + 1;
-            seg_count += 1;
-        }
-    }
-
-    if seg_count < 2 {
-        return Cow::Borrowed(path);
-    }
-
-    let last_start = seg_starts[seg_count - 1];
-    let parent_start = seg_starts[seg_count - 2];
-    let last_seg = &path[last_start..];
-    let parent_seg = &path[parent_start..last_start.saturating_sub(1)];
-
-    let abbrev_prefix_len = (seg_count - 2) * 2;
-    let try1_len = abbrev_prefix_len + parent_seg.len() + 1 + last_seg.len();
-
-    let mut result = String::with_capacity(max_width + 10);
-
-    if try1_len <= max_width || seg_count <= 2 {
-        for &start in seg_starts.iter().take(seg_count.saturating_sub(2)) {
-            if start < bytes.len() && bytes[start] != b'/' {
-                result.push(bytes[start] as char);
-                result.push('/');
-            }
-        }
-        result.push_str(parent_seg);
-        result.push('/');
-        result.push_str(last_seg);
-    } else {
-        for &start in seg_starts.iter().take(seg_count - 1) {
-            if start < bytes.len() && bytes[start] != b'/' {
-                result.push(bytes[start] as char);
-                result.push('/');
-            }
-        }
-        result.push_str(last_seg);
-    }
-
-    Cow::Owned(result)
 }
 
 /// Detect linked worktree name from `git_dir` path
