@@ -16,7 +16,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             name: cc-statusline-macos-arm64
-          - os: macos-13
+          - os: macos-15
             target: x86_64-apple-darwin
             name: cc-statusline-macos-x86_64
           - os: ubuntu-latest
