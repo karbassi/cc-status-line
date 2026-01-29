@@ -1110,6 +1110,33 @@ fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
 }
 
 fn main() {
+    // Handle --version and --help before reading stdin
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--version" | "-V" => {
+                println!("cc-statusline {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--help" | "-h" => {
+                println!("cc-statusline {}", env!("CARGO_PKG_VERSION"));
+                println!();
+                println!("A lightweight, fast status line for Claude Code CLI");
+                println!();
+                println!("USAGE:");
+                println!("    cc-statusline [OPTIONS]");
+                println!();
+                println!("OPTIONS:");
+                println!("    -h, --help       Print help information");
+                println!("    -V, --version    Print version information");
+                println!();
+                println!("Reads JSON input from stdin for Claude Code integration.");
+                return;
+            }
+            _ => {}
+        }
+    }
+
     let mut input = String::with_capacity(4096);
     io::stdin().read_to_string(&mut input).unwrap_or_default();
 
