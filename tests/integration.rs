@@ -345,6 +345,37 @@ fn invalid_json_produces_output() {
 }
 
 // =============================================================================
+// cwd Field Tests
+// =============================================================================
+
+#[test]
+fn cwd_takes_priority_over_workspace_current_dir() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    let json_input = r#"{
+        "cwd": "/tmp/cwd-wins",
+        "workspace": {
+            "current_dir": "/tmp/workspace-loses",
+            "project_dir": "/tmp/project-loses"
+        }
+    }"#;
+
+    let stdout = run_with_json(&path, json_input);
+
+    assert!(
+        stdout.contains("cwd-wins"),
+        "Expected cwd path in output (cwd should take priority): {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("workspace-loses"),
+        "workspace.current_dir should NOT appear when cwd is set: {}",
+        stdout
+    );
+}
+
+// =============================================================================
 // Output Style Tests
 // =============================================================================
 
