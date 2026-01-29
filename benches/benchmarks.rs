@@ -38,6 +38,7 @@ fn bench_startup_full_json(c: &mut Criterion) {
     let binary = env!("CARGO_BIN_EXE_cc-statusline");
 
     let json_input = r#"{
+        "cwd": "/Users/test/project/src/components",
         "model": {"display_name": "Claude Opus 4.5"},
         "context_window": {
             "remaining_percentage": 75.5,

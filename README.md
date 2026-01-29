@@ -85,6 +85,7 @@ Claude Code passes session data via stdin as JSON. All fields are optional:
 
 ```json
 {
+  "cwd": "/path/to/project/src",
   "model": {
     "display_name": "Claude Opus 4.5"
   },
@@ -120,6 +121,8 @@ Claude Code passes session data via stdin as JSON. All fields are optional:
   }
 }
 ```
+
+The `cwd` field is the top-level current working directory. The resolution order for the displayed directory is: `cwd` > `workspace.current_dir` > `workspace.project_dir` > process working directory.
 
 When `git` or `pr` fields are provided in JSON, filesystem detection is skipped for those sections. This is useful for screenshots or testing.
 
