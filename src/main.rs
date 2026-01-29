@@ -183,6 +183,7 @@ fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ClaudeInput {
+    cwd: Option<String>,
     model: Model,
     context_window: ContextWindow,
     cost: Cost,
@@ -1142,13 +1143,13 @@ fn main() {
 
     let data: ClaudeInput = serde_json::from_str(&input).unwrap_or_default();
 
-    let current_dir: Cow<str> = match data.workspace.current_dir.as_deref() {
-        Some(dir) => Cow::Borrowed(dir),
-        None => match data.workspace.project_dir.as_deref() {
-            Some(dir) => Cow::Borrowed(dir), // Default to project_dir if current_dir not set
-            None => Cow::Owned(env::current_dir().unwrap().to_string_lossy().into_owned()),
-        },
-    };
+    let current_dir: Cow<str> = data
+        .cwd
+        .as_deref()
+        .or(data.workspace.current_dir.as_deref())
+        .or(data.workspace.project_dir.as_deref())
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(env::current_dir().unwrap().to_string_lossy().into_owned()));
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
