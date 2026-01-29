@@ -376,3 +376,56 @@ fn json_input_duration() {
         stdout
     );
 }
+
+// =============================================================================
+// Official JSON Fixture Test (Issue #20)
+// =============================================================================
+
+#[test]
+fn official_docs_json_fixture() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Load the full official JSON from https://code.claude.com/docs/en/statusline
+    // Contains fields not used by ClaudeInput (hook_event_name, session_id,
+    // version, model.id, context_window.current_usage). Serde ignores unknown
+    // fields by default, so this confirms the binary doesn't crash.
+    let json_input =
+        fs::read_to_string("tests/fixtures/official_input.json").expect("failed to read fixture");
+
+    let stdout = run_with_json(&path, &json_input);
+
+    // Binary should not crash — output must be non-empty
+    assert!(
+        !stdout.is_empty(),
+        "Expected non-empty output from official JSON fixture"
+    );
+
+    // Model display name
+    assert!(
+        stdout.contains("Opus"),
+        "Expected model display_name 'Opus' in output: {}",
+        stdout
+    );
+
+    // Context remaining percentage (57.5 → 57%)
+    assert!(
+        stdout.contains("57%"),
+        "Expected context remaining '57%' in output: {}",
+        stdout
+    );
+
+    // Total input tokens (15234 → 15K)
+    assert!(
+        stdout.contains("15K"),
+        "Expected total_input_tokens '15K' in output: {}",
+        stdout
+    );
+
+    // Total output tokens (4521 → 4K)
+    assert!(
+        stdout.contains("4K"),
+        "Expected total_output_tokens '4K' in output: {}",
+        stdout
+    );
+}
