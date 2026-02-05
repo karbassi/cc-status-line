@@ -97,6 +97,32 @@ fn is_gh_available() -> bool {
     })
 }
 
+/// Check if we're inside an SSH session by looking for SSH-related env vars
+fn is_ssh_session() -> bool {
+    env::var_os("SSH_CONNECTION").is_some() || env::var_os("SSH_CLIENT").is_some()
+}
+
+/// Get the system hostname via libc gethostname()
+/// Strips the `.local` suffix common on macOS
+fn get_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if ret == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let name = std::str::from_utf8(&buf[..len]).ok()?;
+            Some(name.strip_suffix(".local").unwrap_or(name).to_string())
+        } else {
+            None
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Get GitHub token for API authentication
 /// Tries: 1) `GITHUB_TOKEN` env var, 2) `GH_TOKEN` env var, 3) git credential fill
 fn get_github_token() -> Option<String> {
@@ -1125,17 +1151,35 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
         Cow::Borrowed(current_dir)
     };
 
+    // Detect SSH session and get hostname
+    let hostname = if is_ssh_session() {
+        get_hostname()
+    } else {
+        None
+    };
+
+    // Account for hostname + separator in path width calculation
+    let hostname_width = hostname.as_ref().map_or(0, |h| h.len() + 3); // " • " separator
     let path_width = TERM_WIDTH
         .saturating_sub(project_name.len())
         .saturating_sub(3)
+        .saturating_sub(hostname_width)
         .max(10);
     let abbrev_cwd = abbreviate_path(&display_cwd, path_width);
 
-    writeln!(
-        out,
-        "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
-    )
-    .unwrap_or_default();
+    if let Some(ref host) = hostname {
+        writeln!(
+            out,
+            "{TN_GREEN}{host}{RESET}{SEP}{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
+        )
+        .unwrap_or_default();
+    } else {
+        writeln!(
+            out,
+            "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
+        )
+        .unwrap_or_default();
+    }
 }
 
 /// Detect linked worktree name from `git_dir` path
