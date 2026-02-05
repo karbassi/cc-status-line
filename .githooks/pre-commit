@@ -11,7 +11,7 @@ if [ "$branch" = "main" ]; then
     echo "  git branch my-feature"
     echo "  git worktree add .worktrees/my-feature my-feature"
     echo "  cd .worktrees/my-feature"
-    echo "  git config core.hooksPath .githooks"
+    echo "  git config core.hooksPath ../../.githooks"
     echo ""
     exit 1
 fi
