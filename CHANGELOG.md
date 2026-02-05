@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-02-04
+
+### Added
+
+- SSH hostname detection: display hostname in green on Row 1 when connected via SSH
+- Shared git hooks in `.githooks/` (run `make setup` to enable):
+  - `pre-commit`: auto-format with `cargo fmt`, lint with `cargo clippy`
+  - `pre-push`: run `cargo test` before pushing
+  - `commit-msg`: enforce conventional commit prefixes
+
+## [0.1.3] - 2026-01-28
+
+### Added
+
+- `--version` and `--help` CLI flags
+- Official JSON input fixture test from docs
+
 ## [0.1.2] - 2025-01-20
 
 ### Fixed
