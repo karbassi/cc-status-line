@@ -1,6 +1,14 @@
 #!/bin/sh
-# Pre-commit hook: auto-format with cargo fmt and re-stage changed files
+# Pre-commit hook: auto-format and lint
+
+# Auto-format with cargo fmt and re-stage changed files
 cargo fmt
 git diff --name-only --diff-filter=M | while read -r file; do
     git add "$file"
 done
+
+# Run clippy (deny warnings)
+if ! cargo clippy --all-targets -- -D warnings 2>&1; then
+    echo "error: cargo clippy found warnings. Fix them and retry."
+    exit 1
+fi

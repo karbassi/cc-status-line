@@ -1,0 +1,7 @@
+#!/bin/sh
+# Pre-push hook: run tests before pushing
+
+if ! cargo test 2>&1; then
+    echo "error: cargo test failed. Fix tests before pushing."
+    exit 1
+fi
