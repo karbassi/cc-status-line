@@ -14,6 +14,7 @@ use std::time::SystemTime;
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static GH_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
 
 fn get_home() -> &'static str {
     HOME_DIR.get_or_init(|| {
@@ -102,25 +103,32 @@ fn is_ssh_session() -> bool {
     env::var_os("SSH_CONNECTION").is_some() || env::var_os("SSH_CLIENT").is_some()
 }
 
-/// Get the system hostname via libc gethostname()
-/// Strips the `.local` suffix common on macOS
-fn get_hostname() -> Option<String> {
-    #[cfg(unix)]
-    {
-        let mut buf = [0u8; 256];
-        let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-        if ret == 0 {
-            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            let name = std::str::from_utf8(&buf[..len]).ok()?;
-            Some(name.strip_suffix(".local").unwrap_or(name).to_string())
-        } else {
-            None
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+/// Get the system hostname via libc gethostname() (cached via OnceLock)
+/// Strips the `.local` suffix (used by mDNS/Bonjour on Unix systems)
+fn get_hostname() -> Option<&'static String> {
+    HOSTNAME
+        .get_or_init(|| {
+            #[cfg(unix)]
+            {
+                let mut buf = [0u8; 256];
+                let ret = unsafe {
+                    libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+                };
+                if ret == 0 {
+                    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                    std::str::from_utf8(&buf[..len])
+                        .ok()
+                        .map(|name| name.strip_suffix(".local").unwrap_or(name).to_string())
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        })
+        .as_ref()
 }
 
 /// Get GitHub token for API authentication
@@ -1159,7 +1167,7 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
     };
 
     // Account for hostname + separator in path width calculation
-    let hostname_width = hostname.as_ref().map_or(0, |h| h.len() + 3); // " • " separator
+    let hostname_width = hostname.map_or(0, |h| h.len() + 3); // " • " separator
     let path_width = TERM_WIDTH
         .saturating_sub(project_name.len())
         .saturating_sub(3)
@@ -1167,7 +1175,7 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
         .max(10);
     let abbrev_cwd = abbreviate_path(&display_cwd, path_width);
 
-    if let Some(ref host) = hostname {
+    if let Some(host) = hostname {
         writeln!(
             out,
             "{TN_GREEN}{host}{RESET}{SEP}{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
