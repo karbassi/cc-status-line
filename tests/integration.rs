@@ -80,11 +80,7 @@ fn run_with_json(work_dir: &PathBuf, json_input: &str) -> String {
 }
 
 /// Run the binary with JSON input, extra env vars, and optional env removals; return stdout
-fn run_with_json_env(
-    work_dir: &PathBuf,
-    json_input: &str,
-    env_vars: &[(&str, &str)],
-) -> String {
+fn run_with_json_env(work_dir: &PathBuf, json_input: &str, env_vars: &[(&str, &str)]) -> String {
     run_with_json_env_full(work_dir, json_input, env_vars, &[])
 }
 

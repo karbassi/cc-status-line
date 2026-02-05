@@ -111,9 +111,8 @@ fn get_hostname() -> Option<&'static String> {
             #[cfg(unix)]
             {
                 let mut buf = [0u8; 256];
-                let ret = unsafe {
-                    libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-                };
+                let ret =
+                    unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
                 if ret == 0 {
                     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
                     std::str::from_utf8(&buf[..len])
