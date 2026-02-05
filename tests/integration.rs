@@ -434,6 +434,7 @@ fn json_input_duration() {
 // =============================================================================
 
 #[test]
+#[cfg(unix)] // get_hostname() returns None on Windows
 fn ssh_session_shows_hostname() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let path = temp_dir.path().to_path_buf();
@@ -458,6 +459,7 @@ fn ssh_session_shows_hostname() {
 }
 
 #[test]
+#[cfg(unix)] // get_hostname() returns None on Windows
 fn ssh_client_env_shows_hostname() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let path = temp_dir.path().to_path_buf();

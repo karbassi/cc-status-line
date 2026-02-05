@@ -6,10 +6,16 @@ msg=$(head -1 "$1")
 
 if ! echo "$msg" | grep -qE '^(feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert)(\(.+\))?(!)?: .+'; then
     echo "error: commit message must follow Conventional Commits format:"
-    echo "  <type>: <description>"
+    echo ""
+    echo "  Allowed formats:"
+    echo "    <type>: <description>"
+    echo "    <type>(<scope>): <description>"
+    echo "    <type>!: <description>"
+    echo "    <type>(<scope>)!: <description>"
     echo ""
     echo "  Types: feat, fix, chore, docs, style, refactor, test, perf, ci, build, revert"
     echo "  Example: feat: add SSH hostname detection"
+    echo "  Example: fix(ssh): handle empty hostname"
     echo ""
     echo "  Got: $msg"
     exit 1
