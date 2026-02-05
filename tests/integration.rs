@@ -505,6 +505,214 @@ fn no_ssh_env_no_hostname() {
 }
 
 // =============================================================================
+// Config File Tests
+// =============================================================================
+
+/// Helper to run the binary with a custom config file
+fn run_with_config(work_dir: &PathBuf, json_input: &str, config_content: &str) -> String {
+    let config_dir = work_dir.join(".config").join("claude");
+    fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config_path = config_dir.join("cc-statusline.json");
+    fs::write(&config_path, config_content).expect("failed to write config");
+
+    run_with_json_env(
+        work_dir,
+        json_input,
+        &[(
+            "XDG_CONFIG_HOME",
+            work_dir.join(".config").to_str().unwrap(),
+        )],
+    )
+}
+
+#[test]
+fn config_file_missing_uses_defaults() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Point XDG_CONFIG_HOME to a nonexistent directory
+    let stdout = run_with_json_env(
+        &path,
+        r#"{"model": {"display_name": "Claude Test"}}"#,
+        &[(
+            "XDG_CONFIG_HOME",
+            path.join("nonexistent").to_str().unwrap(),
+        )],
+    );
+
+    // Should still show the model (default behavior)
+    assert!(
+        stdout.contains("Claude Test"),
+        "Expected default behavior with missing config: {}",
+        stdout
+    );
+}
+
+#[test]
+fn config_file_empty_rows_hides_components() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Config with no model row
+    let config = r#"{
+        "rows": [
+            ["project", "path"],
+            ["no_git", "branch"]
+        ]
+    }"#;
+
+    let stdout = run_with_config(
+        &path,
+        r#"{"model": {"display_name": "Claude Test"}}"#,
+        config,
+    );
+
+    // Model should NOT appear (not in config)
+    assert!(
+        !stdout.contains("Claude Test"),
+        "Model should be hidden when not in config rows: {}",
+        stdout
+    );
+}
+
+#[test]
+fn config_file_reorders_components() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Config with tokens before duration
+    let config = r#"{
+        "rows": [
+            ["project", "path"],
+            ["no_git", "branch"],
+            ["tokens", "duration"]
+        ]
+    }"#;
+
+    let stdout = run_with_config(
+        &path,
+        r#"{"cost": {"total_duration_ms": 60000}, "context_window": {"total_input_tokens": 1000, "total_output_tokens": 500}}"#,
+        config,
+    );
+
+    // Both should appear
+    assert!(
+        stdout.contains("1K") && stdout.contains("1m"),
+        "Expected both tokens and duration in output: {}",
+        stdout
+    );
+}
+
+#[test]
+fn config_file_invalid_json_warns_and_uses_defaults() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Create invalid config
+    let config_dir = path.join(".config").join("claude");
+    fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config_path = config_dir.join("cc-statusline.json");
+    fs::write(&config_path, "{invalid json}").expect("failed to write config");
+
+    // Run with the invalid config
+    let binary = get_binary_path();
+    let mut cmd = Command::new(&binary);
+    cmd.current_dir(&path)
+        .env("XDG_CONFIG_HOME", path.join(".config").to_str().unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn binary");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(r#"{"model": {"display_name": "Fallback Test"}}"#.as_bytes())
+        .expect("failed to write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Should warn on stderr
+    assert!(
+        stderr.contains("invalid config"),
+        "Expected warning about invalid config on stderr: {}",
+        stderr
+    );
+
+    // Should still show model (fallback to defaults)
+    assert!(
+        stdout.contains("Fallback Test"),
+        "Expected fallback to defaults with invalid config: {}",
+        stdout
+    );
+}
+
+#[test]
+fn config_init_creates_file() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    let binary = get_binary_path();
+    let output = Command::new(&binary)
+        .arg("--config-init")
+        .env("XDG_CONFIG_HOME", path.join(".config").to_str().unwrap())
+        .current_dir(&path)
+        .output()
+        .expect("failed to run --config-init");
+
+    assert!(output.status.success(), "config-init should succeed");
+
+    let config_path = path
+        .join(".config")
+        .join("claude")
+        .join("cc-statusline.json");
+    assert!(config_path.exists(), "Config file should be created");
+
+    let content = fs::read_to_string(&config_path).expect("failed to read config");
+    assert!(
+        content.contains("\"rows\""),
+        "Config should contain rows: {}",
+        content
+    );
+    assert!(
+        content.contains("\"branch\""),
+        "Config should contain branch component: {}",
+        content
+    );
+}
+
+#[test]
+fn config_unknown_component_ignored() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Config with unknown component
+    let config = r#"{
+        "rows": [
+            ["project", "unknown_future_component", "path"],
+            ["no_git", "branch"],
+            ["model"]
+        ]
+    }"#;
+
+    let stdout = run_with_config(
+        &path,
+        r#"{"model": {"display_name": "Claude Test"}}"#,
+        config,
+    );
+
+    // Should still work, just skip the unknown component
+    assert!(
+        stdout.contains("Claude Test"),
+        "Should handle unknown components gracefully: {}",
+        stdout
+    );
+}
+
+// =============================================================================
 // Official JSON Fixture Test (Issue #20)
 // =============================================================================
 
