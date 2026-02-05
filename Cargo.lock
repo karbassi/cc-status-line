@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "cc-statusline"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "criterion",
  "gix",
