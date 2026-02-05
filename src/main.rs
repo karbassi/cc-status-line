@@ -102,7 +102,18 @@ fn load_config() -> &'static Config {
         // Try to read and parse the file
         match fs::read_to_string(&config_path) {
             Ok(content) => match serde_json::from_str::<Config>(&content) {
-                Ok(config) => config,
+                Ok(config) => {
+                    // Validate config has at least one non-empty row
+                    if config.rows.iter().any(|row| !row.is_empty()) {
+                        config
+                    } else {
+                        eprintln!(
+                            "cc-statusline: config at {} has no valid rows, using defaults",
+                            config_path.display()
+                        );
+                        default_config()
+                    }
+                }
                 Err(e) => {
                     eprintln!(
                         "cc-statusline: invalid config at {}: {e}",
@@ -123,8 +134,17 @@ fn load_config() -> &'static Config {
 }
 
 /// Write default config to file (for --config-init)
-fn write_config_init() -> io::Result<()> {
+/// Returns error if config file already exists (use --config-init --force to overwrite)
+fn write_config_init(force: bool) -> io::Result<()> {
     let config_path = get_config_path();
+
+    // Check if config already exists
+    if config_path.exists() && !force {
+        return Err(io::Error::other(format!(
+            "config file already exists: {}\nUse --config-init --force to overwrite",
+            config_path.display()
+        )));
+    }
 
     // Create parent directories if needed
     if let Some(parent) = config_path.parent() {
@@ -1217,9 +1237,10 @@ fn main() {
                 println!("    cc-statusline [OPTIONS]");
                 println!();
                 println!("OPTIONS:");
-                println!("    -h, --help       Print help information");
-                println!("    -V, --version    Print version information");
-                println!("    --config-init    Create default config file");
+                println!("    -h, --help              Print help information");
+                println!("    -V, --version           Print version information");
+                println!("    --config-init           Create default config file");
+                println!("    --config-init --force   Overwrite existing config file");
                 println!();
                 println!("CONFIG:");
                 println!("    {}", get_config_path().display());
@@ -1228,7 +1249,8 @@ fn main() {
                 return;
             }
             "--config-init" => {
-                if let Err(e) = write_config_init() {
+                let force = args.get(2).is_some_and(|a| a == "--force");
+                if let Err(e) = write_config_init(force) {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
@@ -1584,13 +1606,10 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "path" => {
-            // Calculate available width for path abbreviation
-            let hostname_width = ctx.hostname.map_or(0, |h| h.len() + 3);
-            let path_width = TERM_WIDTH
-                .saturating_sub(ctx.project_name.len())
-                .saturating_sub(3)
-                .saturating_sub(hostname_width)
-                .max(10);
+            // Use a conservative width for path abbreviation
+            // Since config allows placing path on any row, we can't know what other
+            // components share the row. Use ~60% of terminal width as a reasonable default.
+            let path_width = (TERM_WIDTH * 3 / 5).max(20);
             let abbrev = abbreviate_path(&ctx.display_cwd, path_width);
             Some(format!("{TN_CYAN}{abbrev}{RESET}"))
         }
