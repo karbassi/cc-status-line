@@ -115,9 +115,14 @@ fn get_hostname() -> Option<&'static String> {
                     unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
                 if ret == 0 {
                     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                    std::str::from_utf8(&buf[..len])
-                        .ok()
-                        .map(|name| name.strip_suffix(".local").unwrap_or(name).to_string())
+                    std::str::from_utf8(&buf[..len]).ok().and_then(|name| {
+                        let trimmed = name.strip_suffix(".local").unwrap_or(name);
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
                 } else {
                     None
                 }
