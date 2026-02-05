@@ -1,5 +1,20 @@
 #!/bin/sh
-# Pre-commit hook: auto-format and lint
+# Pre-commit hook: block main branch, auto-format and lint
+
+# Prevent commits directly to the main branch
+branch="$(git symbolic-ref --short HEAD 2>/dev/null)"
+
+if [ "$branch" = "main" ]; then
+    echo "Error: Direct commits to 'main' are not allowed."
+    echo "Please create a feature branch and worktree:"
+    echo ""
+    echo "  git branch my-feature"
+    echo "  git worktree add .worktrees/my-feature my-feature"
+    echo "  cd .worktrees/my-feature"
+    echo "  git config core.hooksPath .githooks"
+    echo ""
+    exit 1
+fi
 
 # Capture originally staged files before formatting
 staged_files="$(git diff --cached --name-only --diff-filter=AM)"

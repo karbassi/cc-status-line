@@ -1,6 +1,9 @@
 #!/bin/sh
 # Pre-push hook: run tests before pushing
 
+# Clear git environment variables that can interfere with tests
+unset GIT_DIR GIT_WORK_TREE
+
 if ! cargo test; then
     echo "error: cargo test failed. Fix tests before pushing."
     exit 1
