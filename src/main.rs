@@ -1,7 +1,7 @@
 use cc_statusline::{abbreviate_path, hash_path, parse_github_url, percent_encode, shell_escape};
 use gix::Repository;
 use memmap2::{MmapMut, MmapOptions};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -15,6 +15,20 @@ static HOME_DIR: OnceLock<String> = OnceLock::new();
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static GH_AVAILABLE: OnceLock<bool> = OnceLock::new();
 static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+/// Configuration for display customization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    /// Each inner Vec is one row, containing component names in display order
+    rows: Vec<Vec<String>>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        default_config()
+    }
+}
 
 fn get_home() -> &'static str {
     HOME_DIR.get_or_init(|| {
@@ -23,6 +37,128 @@ fn get_home() -> &'static str {
             .or_else(|_| env::var("USERPROFILE"))
             .unwrap_or_default()
     })
+}
+
+/// Get the default configuration (matches current hardcoded behavior)
+fn default_config() -> Config {
+    Config {
+        rows: vec![
+            vec![
+                "hostname".to_string(),
+                "project".to_string(),
+                "path".to_string(),
+            ],
+            vec![
+                "no_git".to_string(),
+                "branch".to_string(),
+                "worktree".to_string(),
+                "files".to_string(),
+                "ahead_behind".to_string(),
+            ],
+            vec![
+                "pr_number".to_string(),
+                "pr_state".to_string(),
+                "pr_comments".to_string(),
+                "pr_files".to_string(),
+                "pr_checks".to_string(),
+            ],
+            vec![
+                "model".to_string(),
+                "context".to_string(),
+                "style".to_string(),
+            ],
+            vec!["duration".to_string(), "tokens".to_string()],
+        ],
+    }
+}
+
+/// Get path to config file
+/// Uses $XDG_CONFIG_HOME/claude/cc-statusline.json or ~/.config/claude/cc-statusline.json
+fn get_config_path() -> PathBuf {
+    let base = env::var("XDG_CONFIG_HOME").map_or_else(
+        |_| {
+            let home = get_home();
+            if home.is_empty() {
+                PathBuf::from(".config")
+            } else {
+                PathBuf::from(home).join(".config")
+            }
+        },
+        PathBuf::from,
+    );
+    base.join("claude").join("cc-statusline.json")
+}
+
+/// Load configuration from file, returning default if missing or invalid
+fn load_config() -> &'static Config {
+    CONFIG.get_or_init(|| {
+        let config_path = get_config_path();
+
+        // If file doesn't exist, use defaults silently
+        if !config_path.exists() {
+            return default_config();
+        }
+
+        // Try to read and parse the file
+        match fs::read_to_string(&config_path) {
+            Ok(content) => match serde_json::from_str::<Config>(&content) {
+                Ok(config) => {
+                    // Validate config has at least one non-empty row
+                    if config.rows.iter().any(|row| !row.is_empty()) {
+                        config
+                    } else {
+                        eprintln!(
+                            "cc-statusline: config at {} has no valid rows, using defaults",
+                            config_path.display()
+                        );
+                        default_config()
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cc-statusline: invalid config at {}: {e}",
+                        config_path.display()
+                    );
+                    default_config()
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "cc-statusline: failed to read config at {}: {e}",
+                    config_path.display()
+                );
+                default_config()
+            }
+        }
+    })
+}
+
+/// Write default config to file (for --config-init)
+/// Returns error if config file already exists (use --config-init --force to overwrite)
+fn write_config_init(force: bool) -> io::Result<()> {
+    let config_path = get_config_path();
+
+    // Check if config already exists
+    if config_path.exists() && !force {
+        return Err(io::Error::other(format!(
+            "config file already exists: {}\nUse --config-init --force to overwrite",
+            config_path.display()
+        )));
+    }
+
+    // Create parent directories if needed
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Write pretty-printed default config
+    let config = default_config();
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| io::Error::other(format!("failed to serialize config: {e}")))?;
+
+    fs::write(&config_path, json)?;
+    println!("Created config file: {}", config_path.display());
+    Ok(())
 }
 
 /// Get secure per-user cache directory
@@ -1101,10 +1237,23 @@ fn main() {
                 println!("    cc-statusline [OPTIONS]");
                 println!();
                 println!("OPTIONS:");
-                println!("    -h, --help       Print help information");
-                println!("    -V, --version    Print version information");
+                println!("    -h, --help              Print help information");
+                println!("    -V, --version           Print version information");
+                println!("    --config-init           Create default config file");
+                println!("    --config-init --force   Overwrite existing config file");
+                println!();
+                println!("CONFIG:");
+                println!("    {}", get_config_path().display());
                 println!();
                 println!("Reads JSON input from stdin for Claude Code integration.");
+                return;
+            }
+            "--config-init" => {
+                let force = args.get(2).is_some_and(|a| a == "--force");
+                if let Err(e) = write_config_init(force) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
                 return;
             }
             _ => {}
@@ -1127,11 +1276,6 @@ fn main() {
         },
     };
 
-    let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
-
-    write_row1(&mut out, &data, &current_dir);
-
     // Skip filesystem detection if JSON provides git.branch
     let git_repo = if data.git.branch.is_some() {
         None
@@ -1139,59 +1283,14 @@ fn main() {
         get_git_repo(&current_dir)
     };
 
-    write_row2(&mut out, git_repo.as_ref(), &data.git);
-    write_pr_rows(&mut out, git_repo.as_ref(), &data.pr);
-    write_row3(&mut out, &data);
-    write_row4(&mut out, &data);
+    // Load config and render
+    let config = load_config();
+    let ctx = RenderContext::new(&data, &current_dir, git_repo.as_ref());
 
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    write_rows(&mut out, config, &ctx);
     out.flush().unwrap_or_default();
-}
-
-fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
-    let project_name = data
-        .workspace
-        .project_dir
-        .as_ref()
-        .and_then(|p| Path::new(p).file_name())
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-
-    let home = get_home();
-    let display_cwd: Cow<str> = if !home.is_empty() && current_dir.starts_with(home) {
-        Cow::Owned(format!("~{}", &current_dir[home.len()..]))
-    } else {
-        Cow::Borrowed(current_dir)
-    };
-
-    // Detect SSH session and get hostname
-    let hostname = if is_ssh_session() {
-        get_hostname()
-    } else {
-        None
-    };
-
-    // Account for hostname + separator in path width calculation
-    let hostname_width = hostname.map_or(0, |h| h.len() + 3); // " • " separator
-    let path_width = TERM_WIDTH
-        .saturating_sub(project_name.len())
-        .saturating_sub(3)
-        .saturating_sub(hostname_width)
-        .max(10);
-    let abbrev_cwd = abbreviate_path(&display_cwd, path_width);
-
-    if let Some(host) = hostname {
-        writeln!(
-            out,
-            "{TN_GREEN}{host}{RESET}{SEP}{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
-        )
-        .unwrap_or_default();
-    } else {
-        writeln!(
-            out,
-            "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
-        )
-        .unwrap_or_default();
-    }
 }
 
 /// Detect linked worktree name from `git_dir` path
@@ -1247,172 +1346,6 @@ fn get_git_repo(dir: &str) -> Option<GitRepo> {
         git_dir,
         work_dir,
     })
-}
-
-fn write_row2<W: Write>(out: &mut W, git: Option<&GitRepo>, git_input: &GitInput) {
-    // Get branch: prefer JSON input, fallback to filesystem detection
-    let branch = git_input
-        .branch
-        .as_deref()
-        .or_else(|| git.map(|g| g.branch.as_str()));
-
-    let Some(branch) = branch else {
-        writeln!(out, "{TN_GRAY}no git{RESET}").unwrap_or_default();
-        return;
-    };
-
-    write!(out, "{TN_PURPLE}{branch}{RESET}").unwrap_or_default();
-
-    // Worktree: prefer JSON input, fallback to filesystem
-    let worktree = git_input
-        .worktree
-        .as_deref()
-        .or_else(|| git.and_then(|g| g.worktree.as_deref()));
-    if let Some(wt) = worktree {
-        write!(out, "{SEP}{TN_MAGENTA}{wt}{RESET}").unwrap_or_default();
-    }
-
-    // Get stats: prefer JSON input, fallback to cache/detection
-    let (files_changed, ahead, behind) = if git_input.branch.is_some() {
-        // Using JSON input
-        (
-            git_input.changed_files.unwrap_or(0),
-            git_input.ahead.unwrap_or(0),
-            git_input.behind.unwrap_or(0),
-        )
-    } else if let Some(g) = git {
-        // Using filesystem detection
-        let cache = load_mmap_cache(&g.git_dir);
-        let current_mtime = g.index_mtime();
-        let current_oid = g.head_oid();
-
-        let (files, _, _) = if let Some(ref c) = cache {
-            if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
-                (c.files_changed, c.lines_added, c.lines_deleted)
-            } else {
-                compute_and_cache_git_stats(g, current_mtime, &current_oid)
-            }
-        } else {
-            compute_and_cache_git_stats(g, current_mtime, &current_oid)
-        };
-
-        let (a, b) = get_ahead_behind(&g.repo, &g.branch);
-        (files, a, b)
-    } else {
-        (0, 0, 0)
-    };
-
-    if files_changed > 0 {
-        write!(out, "{SEP}{TN_GRAY}{files_changed} files{RESET}").unwrap_or_default();
-    }
-
-    if ahead > 0 || behind > 0 {
-        write!(out, "{SEP}").unwrap_or_default();
-        if ahead > 0 {
-            write!(out, "{TN_GRAY}↑{ahead}{RESET}").unwrap_or_default();
-        }
-        if behind > 0 {
-            if ahead > 0 {
-                write!(out, " ").unwrap_or_default();
-            }
-            write!(out, "{TN_GRAY}↓{behind}{RESET}").unwrap_or_default();
-        }
-    }
-
-    writeln!(out).unwrap_or_default();
-}
-
-/// Write PR info rows (only shown when a PR exists for current branch)
-fn write_pr_rows<W: Write>(out: &mut W, git: Option<&GitRepo>, pr_input: &PrInput) {
-    // Get PR data: prefer JSON input, fallback to cache
-    let (number, state, url, comments, changed_files, check_status) =
-        if let Some(n) = pr_input.number {
-            // Using JSON input
-            (
-                n,
-                pr_input.state.clone().unwrap_or_default(),
-                pr_input.url.clone().unwrap_or_default(),
-                pr_input.comments.unwrap_or(0),
-                pr_input.changed_files.unwrap_or(0),
-                pr_input.check_status.clone().unwrap_or_default(),
-            )
-        } else if let Some(g) = git {
-            // Using filesystem detection
-            let Some(pr) = get_pr_data(g) else { return };
-            (
-                pr.number,
-                pr.state,
-                pr.url,
-                pr.comments,
-                pr.changed_files,
-                pr.check_status,
-            )
-        } else {
-            return;
-        };
-
-    // PR number (cyan, clickable via OSC 8)
-    if url.is_empty() {
-        write!(out, "{TN_CYAN}#{number}{RESET}").unwrap_or_default();
-    } else {
-        write!(
-            out,
-            "{OSC8_START}{url}{OSC8_MID}{TN_CYAN}#{number}{RESET}{OSC8_END}"
-        )
-        .unwrap_or_default();
-    }
-
-    // State with color (case-insensitive match, display lowercase)
-    let state_lower = state.to_lowercase();
-    let state_color = match state_lower.as_str() {
-        "open" => TN_GREEN,
-        "merged" => TN_PURPLE,
-        "closed" => TN_RED,
-        _ => TN_GRAY,
-    };
-    write!(out, "{SEP}{state_color}{state_lower}{RESET}").unwrap_or_default();
-
-    // Comments (if any)
-    if comments > 0 {
-        let label = if comments == 1 { "comment" } else { "comments" };
-        write!(out, "{SEP}{TN_GRAY}{comments} {label}{RESET}").unwrap_or_default();
-    }
-
-    // Changed files
-    if changed_files > 0 {
-        let label = if changed_files == 1 { "file" } else { "files" };
-        write!(out, "{SEP}{TN_GRAY}{changed_files} {label}{RESET}").unwrap_or_default();
-    }
-
-    // Check status (only show if we have a valid status)
-    let checks_url = if url.is_empty() {
-        String::new()
-    } else {
-        format!("{url}/checks")
-    };
-    match check_status.trim() {
-        "passed" if !checks_url.is_empty() => write!(
-            out,
-            "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_GREEN}checks passed{RESET}{OSC8_END}"
-        )
-        .unwrap_or_default(),
-        "failed" if !checks_url.is_empty() => write!(
-            out,
-            "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_RED}checks failed{RESET}{OSC8_END}"
-        )
-        .unwrap_or_default(),
-        "pending" if !checks_url.is_empty() => write!(
-            out,
-            "{SEP}{OSC8_START}{checks_url}{OSC8_MID}{TN_ORANGE}checks pending{RESET}{OSC8_END}"
-        )
-        .unwrap_or_default(),
-        "passed" => write!(out, "{SEP}{TN_GREEN}checks passed{RESET}").unwrap_or_default(),
-        "failed" => write!(out, "{SEP}{TN_RED}checks failed{RESET}").unwrap_or_default(),
-        "pending" => write!(out, "{SEP}{TN_ORANGE}checks pending{RESET}").unwrap_or_default(),
-        _ => {}
-    }
-
-    writeln!(out).unwrap_or_default();
 }
 
 /// Find the configured upstream ref for a branch
@@ -1533,88 +1466,353 @@ fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u3
     (files_changed, lines_added, lines_deleted)
 }
 
-fn write_row3<W: Write>(out: &mut W, data: &ClaudeInput) {
-    let mut has_content = false;
-
-    if let Some(model) = &data.model.display_name
-        && model != "Unknown"
-    {
-        write!(out, "{TN_ORANGE}{model}{RESET}").unwrap_or_default();
-        has_content = true;
-    }
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let context_pct = data.context_window.remaining_percentage.unwrap_or(100.0) as u32;
-    if context_pct < 100 {
-        if has_content {
-            write!(out, "{SEP}").unwrap_or_default();
-        }
-        write!(out, "{TN_TEAL}{context_pct}%{RESET}").unwrap_or_default();
-        has_content = true;
-    }
-
-    if let Some(mode) = &data.output_style.name
-        && mode != "default"
-    {
-        if has_content {
-            write!(out, "{SEP}").unwrap_or_default();
-        }
-        write!(out, "{TN_BLUE}{mode}{RESET}").unwrap_or_default();
-        has_content = true;
-    }
-
-    if has_content {
-        writeln!(out).unwrap_or_default();
-    }
-}
-
-fn write_row4<W: Write>(out: &mut W, data: &ClaudeInput) {
-    let mut has_content = false;
-
-    let duration_ms = data.cost.total_duration_ms.unwrap_or(0);
-    if duration_ms > 0 {
-        let total_secs = duration_ms / 1000;
-        let mins = total_secs / 60;
-        let hours = mins / 60;
-        let mins = mins % 60;
-
-        if hours > 0 {
-            write!(out, "{TN_GRAY}{hours}h {mins}m{RESET}").unwrap_or_default();
-        } else {
-            write!(out, "{TN_GRAY}{mins}m{RESET}").unwrap_or_default();
-        }
-        has_content = true;
-    }
-
-    let input_tokens = data.context_window.total_input_tokens.unwrap_or(0);
-    let output_tokens = data.context_window.total_output_tokens.unwrap_or(0);
-    if input_tokens > 0 || output_tokens > 0 {
-        if has_content {
-            write!(out, "{SEP}").unwrap_or_default();
-        }
-        write!(out, "{TN_GRAY}").unwrap_or_default();
-        write_tokens(out, input_tokens);
-        write!(out, "/").unwrap_or_default();
-        write_tokens(out, output_tokens);
-        write!(out, "{RESET}").unwrap_or_default();
-        has_content = true;
-    }
-
-    if has_content {
-        writeln!(out).unwrap_or_default();
-    }
-}
-
-fn write_tokens<W: Write>(out: &mut W, n: u64) {
+fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         let tenths = n / 100_000;
         let whole = tenths / 10;
         let frac = tenths % 10;
-        let _ = write!(out, "{whole}.{frac}M");
+        format!("{whole}.{frac}M")
     } else if n >= 1_000 {
-        let _ = write!(out, "{}K", n / 1_000);
+        format!("{}K", n / 1_000)
     } else {
-        let _ = write!(out, "{n}");
+        format!("{n}")
+    }
+}
+
+// ============================================================================
+// Config-driven rendering
+// ============================================================================
+
+/// Context for rendering components - holds all data needed by any component
+struct RenderContext<'a> {
+    data: &'a ClaudeInput,
+    git: Option<&'a GitRepo>,
+    // Cached computed values
+    project_name: String,
+    display_cwd: String,
+    hostname: Option<&'static String>,
+    // Git stats (computed lazily via Option)
+    git_stats: Option<(u32, u32, u32)>, // (files_changed, ahead, behind)
+    // PR data (computed lazily)
+    pr_data: Option<PrCacheData>,
+}
+
+impl<'a> RenderContext<'a> {
+    fn new(data: &'a ClaudeInput, current_dir: &'a str, git: Option<&'a GitRepo>) -> Self {
+        let project_name = data
+            .workspace
+            .project_dir
+            .as_ref()
+            .and_then(|p| Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let home = get_home();
+        let display_cwd = if !home.is_empty() && current_dir.starts_with(home) {
+            format!("~{}", &current_dir[home.len()..])
+        } else {
+            current_dir.to_string()
+        };
+
+        let hostname = if is_ssh_session() {
+            get_hostname()
+        } else {
+            None
+        };
+
+        // Compute git stats upfront if we have a git repo and no JSON override
+        let git_stats = if data.git.branch.is_some() {
+            // Using JSON input
+            Some((
+                data.git.changed_files.unwrap_or(0),
+                data.git.ahead.unwrap_or(0),
+                data.git.behind.unwrap_or(0),
+            ))
+        } else if let Some(g) = git {
+            let cache = load_mmap_cache(&g.git_dir);
+            let current_mtime = g.index_mtime();
+            let current_oid = g.head_oid();
+
+            let (files, _, _) = if let Some(ref c) = cache {
+                if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
+                    (c.files_changed, c.lines_added, c.lines_deleted)
+                } else {
+                    compute_and_cache_git_stats(g, current_mtime, &current_oid)
+                }
+            } else {
+                compute_and_cache_git_stats(g, current_mtime, &current_oid)
+            };
+
+            let (ahead, behind) = get_ahead_behind(&g.repo, &g.branch);
+            Some((files, ahead, behind))
+        } else {
+            None
+        };
+
+        // Get PR data
+        let pr_data = if data.pr.number.is_some() {
+            // Using JSON input
+            Some(PrCacheData {
+                number: data.pr.number.unwrap_or(0),
+                state: data.pr.state.clone().unwrap_or_default(),
+                url: data.pr.url.clone().unwrap_or_default(),
+                comments: data.pr.comments.unwrap_or(0),
+                changed_files: data.pr.changed_files.unwrap_or(0),
+                check_status: data.pr.check_status.clone().unwrap_or_default(),
+            })
+        } else {
+            git.and_then(get_pr_data)
+        };
+
+        Self {
+            data,
+            git,
+            project_name,
+            display_cwd,
+            hostname,
+            git_stats,
+            pr_data,
+        }
+    }
+
+    fn branch(&self) -> Option<&str> {
+        self.data
+            .git
+            .branch
+            .as_deref()
+            .or_else(|| self.git.map(|g| g.branch.as_str()))
+    }
+
+    fn worktree(&self) -> Option<&str> {
+        self.data
+            .git
+            .worktree
+            .as_deref()
+            .or_else(|| self.git.and_then(|g| g.worktree.as_deref()))
+    }
+}
+
+/// Render a single component, returning colored output string or None if no data
+fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
+    match name {
+        "hostname" => ctx.hostname.map(|h| format!("{TN_GREEN}{h}{RESET}")),
+
+        "project" => {
+            if ctx.project_name.is_empty() {
+                None
+            } else {
+                Some(format!("{TN_BLUE}{}{RESET}", ctx.project_name))
+            }
+        }
+
+        "path" => {
+            // Use a conservative width for path abbreviation
+            // Since config allows placing path on any row, we can't know what other
+            // components share the row. Use ~60% of terminal width as a reasonable default.
+            let path_width = (TERM_WIDTH * 3 / 5).max(20);
+            let abbrev = abbreviate_path(&ctx.display_cwd, path_width);
+            Some(format!("{TN_CYAN}{abbrev}{RESET}"))
+        }
+
+        "branch" => ctx.branch().map(|b| format!("{TN_PURPLE}{b}{RESET}")),
+
+        // Shows "no git" when there's no branch (not in a git repo)
+        "no_git" => {
+            if ctx.branch().is_none() {
+                Some(format!("{TN_GRAY}no git{RESET}"))
+            } else {
+                None
+            }
+        }
+
+        "worktree" => ctx.worktree().map(|wt| format!("{TN_MAGENTA}{wt}{RESET}")),
+
+        "files" => {
+            let files = ctx.git_stats.map(|(f, _, _)| f).unwrap_or(0);
+            if files > 0 {
+                Some(format!("{TN_GRAY}{files} files{RESET}"))
+            } else {
+                None
+            }
+        }
+
+        "ahead_behind" => {
+            let (ahead, behind) = ctx.git_stats.map(|(_, a, b)| (a, b)).unwrap_or((0, 0));
+            if ahead > 0 || behind > 0 {
+                let mut s = String::new();
+                if ahead > 0 {
+                    s.push_str(&format!("{TN_GRAY}↑{ahead}{RESET}"));
+                }
+                if behind > 0 {
+                    if ahead > 0 {
+                        s.push(' ');
+                    }
+                    s.push_str(&format!("{TN_GRAY}↓{behind}{RESET}"));
+                }
+                Some(s)
+            } else {
+                None
+            }
+        }
+
+        "pr_number" => {
+            let pr = ctx.pr_data.as_ref()?;
+            if pr.url.is_empty() {
+                Some(format!("{TN_CYAN}#{}{RESET}", pr.number))
+            } else {
+                Some(format!(
+                    "{OSC8_START}{}{OSC8_MID}{TN_CYAN}#{}{RESET}{OSC8_END}",
+                    pr.url, pr.number
+                ))
+            }
+        }
+
+        "pr_state" => {
+            let pr = ctx.pr_data.as_ref()?;
+            let state_lower = pr.state.to_lowercase();
+            let color = match state_lower.as_str() {
+                "open" => TN_GREEN,
+                "merged" => TN_PURPLE,
+                "closed" => TN_RED,
+                _ => TN_GRAY,
+            };
+            Some(format!("{color}{state_lower}{RESET}"))
+        }
+
+        "pr_comments" => {
+            let pr = ctx.pr_data.as_ref()?;
+            if pr.comments > 0 {
+                let label = if pr.comments == 1 {
+                    "comment"
+                } else {
+                    "comments"
+                };
+                Some(format!("{TN_GRAY}{} {label}{RESET}", pr.comments))
+            } else {
+                None
+            }
+        }
+
+        "pr_files" => {
+            let pr = ctx.pr_data.as_ref()?;
+            if pr.changed_files > 0 {
+                let label = if pr.changed_files == 1 {
+                    "file"
+                } else {
+                    "files"
+                };
+                Some(format!("{TN_GRAY}{} {label}{RESET}", pr.changed_files))
+            } else {
+                None
+            }
+        }
+
+        "pr_checks" => {
+            let pr = ctx.pr_data.as_ref()?;
+            let checks_url = if pr.url.is_empty() {
+                String::new()
+            } else {
+                format!("{}/checks", pr.url)
+            };
+            match pr.check_status.trim() {
+                "passed" if !checks_url.is_empty() => Some(format!(
+                    "{OSC8_START}{checks_url}{OSC8_MID}{TN_GREEN}checks passed{RESET}{OSC8_END}"
+                )),
+                "failed" if !checks_url.is_empty() => Some(format!(
+                    "{OSC8_START}{checks_url}{OSC8_MID}{TN_RED}checks failed{RESET}{OSC8_END}"
+                )),
+                "pending" if !checks_url.is_empty() => Some(format!(
+                    "{OSC8_START}{checks_url}{OSC8_MID}{TN_ORANGE}checks pending{RESET}{OSC8_END}"
+                )),
+                "passed" => Some(format!("{TN_GREEN}checks passed{RESET}")),
+                "failed" => Some(format!("{TN_RED}checks failed{RESET}")),
+                "pending" => Some(format!("{TN_ORANGE}checks pending{RESET}")),
+                _ => None,
+            }
+        }
+
+        "model" => {
+            if let Some(model) = &ctx.data.model.display_name
+                && model != "Unknown"
+            {
+                return Some(format!("{TN_ORANGE}{model}{RESET}"));
+            }
+            None
+        }
+
+        "context" => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = ctx
+                .data
+                .context_window
+                .remaining_percentage
+                .unwrap_or(100.0) as u32;
+            if pct < 100 {
+                Some(format!("{TN_TEAL}{pct}%{RESET}"))
+            } else {
+                None
+            }
+        }
+
+        "style" => {
+            if let Some(mode) = &ctx.data.output_style.name
+                && mode != "default"
+            {
+                return Some(format!("{TN_BLUE}{mode}{RESET}"));
+            }
+            None
+        }
+
+        "duration" => {
+            let ms = ctx.data.cost.total_duration_ms.unwrap_or(0);
+            if ms > 0 {
+                let total_secs = ms / 1000;
+                let mins = total_secs / 60;
+                let hours = mins / 60;
+                let mins = mins % 60;
+                if hours > 0 {
+                    Some(format!("{TN_GRAY}{hours}h {mins}m{RESET}"))
+                } else {
+                    Some(format!("{TN_GRAY}{mins}m{RESET}"))
+                }
+            } else {
+                None
+            }
+        }
+
+        "tokens" => {
+            let input = ctx.data.context_window.total_input_tokens.unwrap_or(0);
+            let output = ctx.data.context_window.total_output_tokens.unwrap_or(0);
+            if input > 0 || output > 0 {
+                Some(format!(
+                    "{TN_GRAY}{}/{}{RESET}",
+                    format_tokens(input),
+                    format_tokens(output)
+                ))
+            } else {
+                None
+            }
+        }
+
+        _ => None, // Unknown component - ignore silently for forward compatibility
+    }
+}
+
+/// Write all rows according to config
+fn write_rows<W: Write>(out: &mut W, config: &Config, ctx: &RenderContext) {
+    for row_components in &config.rows {
+        if row_components.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<String> = row_components
+            .iter()
+            .filter_map(|name| render_component(name, ctx))
+            .collect();
+
+        if !parts.is_empty() {
+            writeln!(out, "{}", parts.join(SEP)).unwrap_or_default();
+        }
     }
 }
 
@@ -1938,56 +2136,42 @@ mod tests {
     }
 
     // =========================================================================
-    // write_tokens tests
+    // format_tokens tests
     // =========================================================================
 
     #[test]
     fn tokens_small() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 42);
-        assert_eq!(String::from_utf8(buf).unwrap(), "42");
+        assert_eq!(format_tokens(42), "42");
     }
 
     #[test]
     fn tokens_thousands() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 5_432);
-        assert_eq!(String::from_utf8(buf).unwrap(), "5K");
+        assert_eq!(format_tokens(5_432), "5K");
     }
 
     #[test]
     fn tokens_exact_thousand() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 1_000);
-        assert_eq!(String::from_utf8(buf).unwrap(), "1K");
+        assert_eq!(format_tokens(1_000), "1K");
     }
 
     #[test]
     fn tokens_millions() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 2_500_000);
-        assert_eq!(String::from_utf8(buf).unwrap(), "2.5M");
+        assert_eq!(format_tokens(2_500_000), "2.5M");
     }
 
     #[test]
     fn tokens_exact_million() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 1_000_000);
-        assert_eq!(String::from_utf8(buf).unwrap(), "1.0M");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
     }
 
     #[test]
     fn tokens_zero() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 0);
-        assert_eq!(String::from_utf8(buf).unwrap(), "0");
+        assert_eq!(format_tokens(0), "0");
     }
 
     #[test]
     fn tokens_large_millions() {
-        let mut buf = Vec::new();
-        write_tokens(&mut buf, 15_700_000);
-        assert_eq!(String::from_utf8(buf).unwrap(), "15.7M");
+        assert_eq!(format_tokens(15_700_000), "15.7M");
     }
 
     // =========================================================================

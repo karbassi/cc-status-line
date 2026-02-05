@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-02-05
+
+### Added
+
+- **Config file support**: Customize display via `~/.config/claude/cc-statusline.json`
+  - Choose which components to show and their order
+  - Organize components into rows
+  - Respects `XDG_CONFIG_HOME` environment variable
+- New `--config-init` flag to create default config file
+- New `--config-init --force` flag to overwrite existing config
+- 17 configurable components: `hostname`, `project`, `path`, `no_git`, `branch`, `worktree`, `files`, `ahead_behind`, `pr_number`, `pr_state`, `pr_comments`, `pr_files`, `pr_checks`, `model`, `context`, `style`, `duration`, `tokens`
+
+### Changed
+
+- Path abbreviation now uses conservative fixed width (60% of terminal) for config flexibility
+
 ## [0.1.4] - 2026-02-04
 
 ### Added
