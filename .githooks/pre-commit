@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pre-commit hook: auto-format and lint
+
+# Capture originally staged files before formatting
+staged_files="$(git diff --cached --name-only --diff-filter=AM)"
+
+# Auto-format with cargo fmt
+cargo fmt
+
+# Re-stage only originally staged files that were modified by fmt
+printf '%s\n' "$staged_files" | while IFS= read -r file; do
+    if [ -n "$file" ] && git diff --name-only -- "$file" | grep -q .; then
+        git add "$file"
+    fi
+done
+
+# Run clippy (deny warnings)
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo "error: cargo clippy found warnings. Fix them and retry."
+    exit 1
+fi

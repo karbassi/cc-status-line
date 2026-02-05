@@ -1,4 +1,7 @@
-.PHONY: build release screenshots clean
+.PHONY: setup build release screenshots clean
+
+setup:
+	git config core.hooksPath .githooks
 
 build:
 	cargo build

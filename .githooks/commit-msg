@@ -1,0 +1,22 @@
+#!/bin/sh
+# Commit-msg hook: enforce conventional commit prefixes
+# Allows: feat, fix, chore, docs, style, refactor, test, perf, ci, build, revert
+
+msg=$(head -1 "$1")
+
+if ! echo "$msg" | grep -qE '^(feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert)(\(.+\))?(!)?: .+'; then
+    echo "error: commit message must follow Conventional Commits format:"
+    echo ""
+    echo "  Allowed formats:"
+    echo "    <type>: <description>"
+    echo "    <type>(<scope>): <description>"
+    echo "    <type>!: <description>"
+    echo "    <type>(<scope>)!: <description>"
+    echo ""
+    echo "  Types: feat, fix, chore, docs, style, refactor, test, perf, ci, build, revert"
+    echo "  Example: feat: add SSH hostname detection"
+    echo "  Example: fix(ssh): handle empty hostname"
+    echo ""
+    echo "  Got: $msg"
+    exit 1
+fi

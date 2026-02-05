@@ -14,6 +14,7 @@ use std::time::SystemTime;
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static GH_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
 
 fn get_home() -> &'static str {
     HOME_DIR.get_or_init(|| {
@@ -95,6 +96,43 @@ fn is_gh_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     })
+}
+
+/// Check if we're inside an SSH session by looking for SSH-related env vars
+fn is_ssh_session() -> bool {
+    env::var_os("SSH_CONNECTION").is_some() || env::var_os("SSH_CLIENT").is_some()
+}
+
+/// Get the system hostname via libc gethostname() (cached via OnceLock)
+/// Strips the `.local` suffix (used by mDNS/Bonjour on Unix systems)
+fn get_hostname() -> Option<&'static String> {
+    HOSTNAME
+        .get_or_init(|| {
+            #[cfg(unix)]
+            {
+                let mut buf = [0u8; 256];
+                let ret =
+                    unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+                if ret == 0 {
+                    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                    std::str::from_utf8(&buf[..len]).ok().and_then(|name| {
+                        let trimmed = name.strip_suffix(".local").unwrap_or(name);
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        })
+        .as_ref()
 }
 
 /// Get GitHub token for API authentication
@@ -1125,17 +1163,35 @@ fn write_row1<W: Write>(out: &mut W, data: &ClaudeInput, current_dir: &str) {
         Cow::Borrowed(current_dir)
     };
 
+    // Detect SSH session and get hostname
+    let hostname = if is_ssh_session() {
+        get_hostname()
+    } else {
+        None
+    };
+
+    // Account for hostname + separator in path width calculation
+    let hostname_width = hostname.map_or(0, |h| h.len() + 3); // " • " separator
     let path_width = TERM_WIDTH
         .saturating_sub(project_name.len())
         .saturating_sub(3)
+        .saturating_sub(hostname_width)
         .max(10);
     let abbrev_cwd = abbreviate_path(&display_cwd, path_width);
 
-    writeln!(
-        out,
-        "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
-    )
-    .unwrap_or_default();
+    if let Some(host) = hostname {
+        writeln!(
+            out,
+            "{TN_GREEN}{host}{RESET}{SEP}{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
+        )
+        .unwrap_or_default();
+    } else {
+        writeln!(
+            out,
+            "{TN_BLUE}{project_name}{RESET}{SEP}{TN_CYAN}{abbrev_cwd}{RESET}"
+        )
+        .unwrap_or_default();
+    }
 }
 
 /// Detect linked worktree name from `git_dir` path

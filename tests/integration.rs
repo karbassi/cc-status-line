@@ -76,15 +76,36 @@ fn make_commit(repo_path: &PathBuf, message: &str) {
 
 /// Run the binary with JSON input and return stdout
 fn run_with_json(work_dir: &PathBuf, json_input: &str) -> String {
+    run_with_json_env(work_dir, json_input, &[])
+}
+
+/// Run the binary with JSON input, extra env vars, and optional env removals; return stdout
+fn run_with_json_env(work_dir: &PathBuf, json_input: &str, env_vars: &[(&str, &str)]) -> String {
+    run_with_json_env_full(work_dir, json_input, env_vars, &[])
+}
+
+fn run_with_json_env_full(
+    work_dir: &PathBuf,
+    json_input: &str,
+    env_vars: &[(&str, &str)],
+    env_remove: &[&str],
+) -> String {
     let binary = get_binary_path();
 
-    let mut child = Command::new(&binary)
-        .current_dir(work_dir)
+    let mut cmd = Command::new(&binary);
+    cmd.current_dir(work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn binary");
+        .stderr(Stdio::piped());
+
+    for &(key, val) in env_vars {
+        cmd.env(key, val);
+    }
+    for &key in env_remove {
+        cmd.env_remove(key);
+    }
+
+    let mut child = cmd.spawn().expect("failed to spawn binary");
 
     child
         .stdin
@@ -405,6 +426,81 @@ fn json_input_duration() {
         stdout.contains("2m"),
         "Expected duration in output: {}",
         stdout
+    );
+}
+
+// =============================================================================
+// SSH Hostname Detection Tests
+// =============================================================================
+
+#[test]
+#[cfg(unix)] // get_hostname() returns None on Windows
+fn ssh_session_shows_hostname() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    let stdout = run_with_json_env(
+        &path,
+        r#"{"workspace": {"project_dir": "/tmp/myproject"}}"#,
+        &[("SSH_CONNECTION", "192.168.1.1 22 192.168.1.2 22")],
+    );
+
+    // The hostname should appear in the output (exact value depends on the machine)
+    // Row 1 should have at least 3 separator-delimited segments: hostname • project • path
+    let first_line = stdout.lines().next().unwrap_or("");
+    // Count visible " • " separators (the separator includes ANSI codes, but the text " • " is present)
+    let sep_count = first_line.matches(" • ").count();
+    assert!(
+        sep_count >= 2,
+        "Expected at least 2 separators in SSH row1 (hostname • project • path), got {}: {}",
+        sep_count,
+        first_line
+    );
+}
+
+#[test]
+#[cfg(unix)] // get_hostname() returns None on Windows
+fn ssh_client_env_shows_hostname() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    let stdout = run_with_json_env(
+        &path,
+        r#"{"workspace": {"project_dir": "/tmp/myproject"}}"#,
+        &[("SSH_CLIENT", "192.168.1.1 12345 22")],
+    );
+
+    let first_line = stdout.lines().next().unwrap_or("");
+    let sep_count = first_line.matches(" • ").count();
+    assert!(
+        sep_count >= 2,
+        "Expected at least 2 separators with SSH_CLIENT set, got {}: {}",
+        sep_count,
+        first_line
+    );
+}
+
+#[test]
+fn no_ssh_env_no_hostname() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let path = temp_dir.path().to_path_buf();
+
+    // Explicitly remove SSH env vars (test runner might itself be in an SSH session)
+    let stdout = run_with_json_env_full(
+        &path,
+        r#"{"workspace": {"project_dir": "/tmp/myproject"}}"#,
+        &[],
+        &["SSH_CONNECTION", "SSH_CLIENT"],
+    );
+
+    let first_line = stdout.lines().next().unwrap_or("");
+    // Without SSH, row1 should have exactly 1 separator: project • path
+    let sep_count = first_line.matches(" • ").count();
+    assert!(
+        sep_count == 1,
+        "Expected exactly 1 separator without SSH (project • path), got {}: {}",
+        sep_count,
+        first_line
     );
 }
 
