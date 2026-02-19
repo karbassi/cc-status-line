@@ -73,20 +73,16 @@ fn default_config() -> Config {
 }
 
 /// Get path to config file
-/// Uses $XDG_CONFIG_HOME/claude/cc-statusline.json or ~/.config/claude/cc-statusline.json
+/// Uses ~/.claude/cc-statusline.json
 fn get_config_path() -> PathBuf {
-    let base = env::var("XDG_CONFIG_HOME").map_or_else(
-        |_| {
-            let home = get_home();
-            if home.is_empty() {
-                PathBuf::from(".config")
-            } else {
-                PathBuf::from(home).join(".config")
-            }
-        },
-        PathBuf::from,
-    );
-    base.join("claude").join("cc-statusline.json")
+    let home = get_home();
+    if home.is_empty() {
+        PathBuf::from(".claude").join("cc-statusline.json")
+    } else {
+        PathBuf::from(home)
+            .join(".claude")
+            .join("cc-statusline.json")
+    }
 }
 
 /// Load configuration from file, returning default if missing or invalid

@@ -23,7 +23,7 @@ Restart Claude Code to see the new status line.
 
 ## Design
 
-4-5 row status line with Tokyo Night colors and dot (•) dividers. PR row appears when a PR exists for the current branch.
+4 row status line with Tokyo Night colors and dot (•) dividers. PR row appears when a PR exists for the current branch. Layout is configurable via `~/.claude/cc-statusline.json`.
 
 See all screenshot variations in [docs/screenshots/](docs/screenshots/).
 
@@ -53,15 +53,11 @@ See all screenshot variations in [docs/screenshots/](docs/screenshots/).
 
 If no authentication is available, the PR row will not appear. On Windows, use an environment variable or git credential helper since `gh auth login` is not used by the native HTTP path.
 
-### Row 4: Claude
+### Row 4: Claude + Session
 - Model (Opus/Sonnet/Haiku)
 - Context % remaining
 - Output mode
-- Block timer
-
-### Row 5: Session
 - Session duration
-- Block reset countdown
 - Tokens (in/out)
 
 ## Style
@@ -133,7 +129,7 @@ When `git` or `pr` fields are provided in JSON, filesystem detection is skipped 
 | `GITHUB_TOKEN` | GitHub API token for PR info (preferred) |
 | `GH_TOKEN` | Alternative GitHub token (used by gh CLI) |
 | `XDG_CACHE_HOME` | Cache directory base (default: `~/.cache`) |
-| `HOME` | User home directory for `~` expansion |
+| `HOME` | User home directory for `~` expansion and config file location |
 
 Cache files are stored in `$XDG_CACHE_HOME/cc-statusline/` (or `~/.cache/cc-statusline/`).
 
