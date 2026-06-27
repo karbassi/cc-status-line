@@ -1,15 +1,18 @@
-use cc_statusline::{abbreviate_path, hash_path, parse_github_url, percent_encode, shell_escape};
-use gix::Repository;
-use memmap2::{MmapMut, MmapOptions};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::SystemTime;
+
+mod git;
+mod pr;
+mod render;
+
+use git::get_git_repo;
+use render::{gather, write_rows};
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -19,9 +22,9 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 
 /// Configuration for display customization
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
+pub(crate) struct Config {
     /// Each inner Vec is one row, containing component names in display order
-    rows: Vec<Vec<String>>,
+    pub(crate) rows: Vec<Vec<String>>,
 }
 
 impl Default for Config {
@@ -30,7 +33,7 @@ impl Default for Config {
     }
 }
 
-fn get_home() -> &'static str {
+pub(crate) fn get_home() -> &'static str {
     HOME_DIR.get_or_init(|| {
         // Try HOME first (Unix standard), then USERPROFILE (Windows standard)
         env::var("HOME")
@@ -163,7 +166,7 @@ fn write_config_init(force: bool) -> io::Result<()> {
 
 /// Get secure per-user cache directory
 /// Uses $XDG_CACHE_HOME/cc-statusline or ~/.cache/cc-statusline
-fn get_cache_dir() -> &'static PathBuf {
+pub(crate) fn get_cache_dir() -> &'static PathBuf {
     CACHE_DIR.get_or_init(|| {
         let base = env::var("XDG_CACHE_HOME").map_or_else(
             |_| {
@@ -222,7 +225,7 @@ fn get_cache_dir() -> &'static PathBuf {
 }
 
 /// Check if gh CLI is available (cached)
-fn is_gh_available() -> bool {
+pub(crate) fn is_gh_available() -> bool {
     *GH_AVAILABLE.get_or_init(|| {
         Command::new("gh")
             .arg("--version")
@@ -235,13 +238,13 @@ fn is_gh_available() -> bool {
 }
 
 /// Check if we're inside an SSH session by looking for SSH-related env vars
-fn is_ssh_session() -> bool {
+pub(crate) fn is_ssh_session() -> bool {
     env::var_os("SSH_CONNECTION").is_some() || env::var_os("SSH_CLIENT").is_some()
 }
 
 /// Get the system hostname via libc gethostname() (cached via OnceLock)
 /// Strips the `.local` suffix (used by mDNS/Bonjour on Unix systems)
-fn get_hostname() -> Option<&'static String> {
+pub(crate) fn get_hostname() -> Option<&'static String> {
     HOSTNAME
         .get_or_init(|| {
             #[cfg(unix)]
@@ -273,7 +276,7 @@ fn get_hostname() -> Option<&'static String> {
 
 /// Get GitHub token for API authentication
 /// Tries: 1) `GITHUB_TOKEN` env var, 2) `GH_TOKEN` env var, 3) git credential fill
-fn get_github_token() -> Option<String> {
+pub(crate) fn get_github_token() -> Option<String> {
     // Try GITHUB_TOKEN env first
     if let Ok(token) = env::var("GITHUB_TOKEN")
         && !token.is_empty()
@@ -315,444 +318,22 @@ fn get_github_token() -> Option<String> {
     None
 }
 
-// Tokyo Night Colors (bright)
-const RESET: &str = "\x1b[0m";
-const TN_BLUE: &str = "\x1b[38;2;122;162;247m";
-const TN_CYAN: &str = "\x1b[38;2;125;207;255m";
-const TN_PURPLE: &str = "\x1b[38;2;187;154;247m";
-const TN_MAGENTA: &str = "\x1b[38;2;157;124;216m";
-const TN_GREEN: &str = "\x1b[38;2;158;206;106m";
-const TN_ORANGE: &str = "\x1b[38;2;255;158;100m";
-const TN_TEAL: &str = "\x1b[38;2;42;195;222m";
-const TN_GRAY: &str = "\x1b[38;2;120;140;180m";
-const TN_RED: &str = "\x1b[38;2;247;118;142m";
-
-const SEP: &str = "\x1b[38;2;86;95;137m • \x1b[0m";
-
-// OSC 8 hyperlink escape sequences (using BEL terminator for broader compatibility)
-const OSC8_START: &str = "\x1b]8;;";
-const OSC8_MID: &str = "\x07";
-const OSC8_END: &str = "\x1b]8;;\x07";
-
-const TERM_WIDTH: usize = 50;
-
 /// Best-effort cross-platform rename that overwrites the destination.
 ///
 /// On Unix-like platforms this is typically atomic. On Windows, `fs::rename`
 /// fails if the destination exists, so we remove the destination first and
 /// then rename. This is *not* a truly atomic replacement on Windows, as
 /// there is a brief window where the destination path does not exist.
-fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
     // On Windows, fs::rename fails if destination exists; remove it first.
     #[cfg(windows)]
     let _ = fs::remove_file(to);
     fs::rename(from, to)
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ClaudeInput {
-    cwd: Option<String>,
-    model: Model,
-    context_window: ContextWindow,
-    cost: Cost,
-    output_style: OutputStyle,
-    workspace: Workspace,
-    git: GitInput,
-    pr: PrInput,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Model {
-    display_name: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ContextWindow {
-    remaining_percentage: Option<f64>,
-    total_input_tokens: Option<u64>,
-    total_output_tokens: Option<u64>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Cost {
-    total_duration_ms: Option<u64>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct OutputStyle {
-    name: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Workspace {
-    project_dir: Option<String>,
-    current_dir: Option<String>,
-}
-
-/// Git info from JSON input (for screenshots/testing)
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct GitInput {
-    branch: Option<String>,
-    worktree: Option<String>,
-    changed_files: Option<u32>,
-    ahead: Option<u32>,
-    behind: Option<u32>,
-}
-
-/// PR info from JSON input (for screenshots/testing)
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PrInput {
-    number: Option<u32>,
-    state: Option<String>,
-    url: Option<String>,
-    comments: Option<u32>,
-    changed_files: Option<u32>,
-    check_status: Option<String>,
-}
-
-/// Binary cache format for mmap (fixed 128 bytes)
-const CACHE_SIZE: usize = 128;
-const CACHE_MAGIC: &[u8; 4] = b"CCST";
-const CACHE_VERSION: u32 = 1;
-
-struct MmapCache {
-    index_mtime: u64,
-    head_oid: [u8; 40],
-    files_changed: u32,
-    lines_added: u32,
-    lines_deleted: u32,
-    ahead: u32,
-    behind: u32,
-}
-
-impl Default for MmapCache {
-    fn default() -> Self {
-        Self {
-            index_mtime: 0,
-            head_oid: [0u8; 40],
-            files_changed: 0,
-            lines_added: 0,
-            lines_deleted: 0,
-            ahead: 0,
-            behind: 0,
-        }
-    }
-}
-
-impl MmapCache {
-    fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < CACHE_SIZE || &data[0..4] != CACHE_MAGIC {
-            return None;
-        }
-        let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
-        if version != CACHE_VERSION {
-            return None;
-        }
-
-        let mut head_oid = [0u8; 40];
-        head_oid.copy_from_slice(&data[16..56]);
-        Some(MmapCache {
-            index_mtime: u64::from_le_bytes(data[8..16].try_into().ok()?),
-            head_oid,
-            files_changed: u32::from_le_bytes(data[56..60].try_into().ok()?),
-            lines_added: u32::from_le_bytes(data[60..64].try_into().ok()?),
-            lines_deleted: u32::from_le_bytes(data[64..68].try_into().ok()?),
-            ahead: u32::from_le_bytes(data[68..72].try_into().ok()?),
-            behind: u32::from_le_bytes(data[72..76].try_into().ok()?),
-        })
-    }
-
-    fn to_bytes(&self, buf: &mut [u8]) {
-        buf[0..4].copy_from_slice(CACHE_MAGIC);
-        buf[4..8].copy_from_slice(&CACHE_VERSION.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.index_mtime.to_le_bytes());
-        buf[16..56].copy_from_slice(&self.head_oid);
-        buf[56..60].copy_from_slice(&self.files_changed.to_le_bytes());
-        buf[60..64].copy_from_slice(&self.lines_added.to_le_bytes());
-        buf[64..68].copy_from_slice(&self.lines_deleted.to_le_bytes());
-        buf[68..72].copy_from_slice(&self.ahead.to_le_bytes());
-        buf[72..76].copy_from_slice(&self.behind.to_le_bytes());
-    }
-
-    fn head_oid_matches(&self, oid: &str) -> bool {
-        let oid_bytes = oid.as_bytes();
-        oid_bytes.len() <= 40 && self.head_oid[..oid_bytes.len()] == *oid_bytes
-    }
-}
-
-// ============================================================================
-// PR Cache
-// ============================================================================
-
-/// PR cache data - parsed from gh JSON output
-#[derive(Default, Clone)]
-struct PrCacheData {
-    number: u32,
-    state: String,
-    url: String,
-    comments: u32,
-    changed_files: u32,
-    check_status: String, // "passed", "failed", "pending", ""
-}
-
-/// JSON structure from gh pr view (or native API cache)
-/// Supports both gh CLI format (comments as array) and native format (commentsCount as number)
-#[derive(Deserialize, Default)]
-struct GhPrJson {
-    number: Option<u64>,
-    state: Option<String>,
-    url: Option<String>,
-    /// gh CLI returns array, native API stores count directly
-    comments: Option<Vec<serde_json::Value>>,
-    /// Native API stores count directly (preferred, avoids large array allocation)
-    #[serde(rename = "commentsCount")]
-    comments_count: Option<u64>,
-    #[serde(rename = "changedFiles")]
-    changed_files: Option<u64>,
-    #[serde(rename = "statusCheckRollup")]
-    status_check_rollup: Option<Vec<GhCheckRun>>,
-}
-
-#[derive(Deserialize)]
-struct GhCheckRun {
-    conclusion: Option<String>,
-}
-
-const PR_CACHE_TTL: u64 = 60; // seconds
-const PR_NEGATIVE_CACHE_TTL: u64 = 300; // 5 minutes for "no PR" cache
-const PR_REFRESH_THROTTLE: u64 = 30; // minimum seconds between refresh attempts
-
-/// Result of loading PR cache - handles all states in one read
-enum PrCacheResult {
-    Hit(PrCacheData), // Valid PR data
-    NoPr,             // Negative cache: no PR exists for this branch
-    Stale,            // Cache is stale or error occurred, needs refresh
-}
-
-fn get_pr_cache_path(repo_path: &str, branch: &str) -> PathBuf {
-    let key = format!("{repo_path}:{branch}");
-    get_cache_dir().join(format!("pr-{:016x}.cache", hash_path(&key)))
-}
-
-fn get_pr_attempt_path(repo_path: &str, branch: &str) -> PathBuf {
-    let key = format!("{repo_path}:{branch}");
-    get_cache_dir().join(format!("pr-attempt-{:016x}", hash_path(&key)))
-}
-
-// ----------------------------------------------------------------------------
-// PR cache codec — the single home for the on-disk format.
-//
-// Format: `timestamp\nbranch\npayload`, where payload is a JSON blob, the
-// `NO_PR` negative-cache marker, or an `ERROR:...` marker. Every Rust writer
-// goes through `encode_pr_cache`; the one exception is the detached gh refresh
-// shell script (`spawn_pr_refresh_gh`), which builds the same layout via printf
-// because it runs in a separate process.
-// ponytail: keep this format dead simple (line-delimited); switch to a struct +
-// serde only if a field ever needs escaping.
-// ----------------------------------------------------------------------------
-
-fn encode_pr_cache(timestamp: u64, branch: &str, payload: &str) -> String {
-    format!("{timestamp}\n{branch}\n{payload}")
-}
-
-struct DecodedPrCache {
-    timestamp: u64,
-    branch: String,
-    payload: String,
-}
-
-fn decode_pr_cache(content: &str) -> Option<DecodedPrCache> {
-    let mut lines = content.lines();
-    let timestamp = lines.next()?.parse().ok()?;
-    let branch = lines.next()?.to_string();
-    let payload = lines.collect::<Vec<_>>().join("\n");
-    Some(DecodedPrCache {
-        timestamp,
-        branch,
-        payload,
-    })
-}
-
-/// Reduce a check-run rollup to "passed" / "failed" / "pending" / "".
-///
-/// gh CLI returns uppercase conclusions (`SUCCESS`), the REST API lowercase
-/// (`success`); matched case-insensitively. Any non-passing conclusion is a
-/// failure; a missing conclusion is pending.
-fn compute_check_status(rollup: Option<&[GhCheckRun]>) -> String {
-    let checks = match rollup {
-        Some(c) if !c.is_empty() => c,
-        _ => return String::new(),
-    };
-
-    let is_passing = |s: &str| {
-        matches!(
-            s.to_ascii_uppercase().as_str(),
-            "SUCCESS" | "SKIPPED" | "NEUTRAL"
-        )
-    };
-
-    let has_failure = checks.iter().any(|c| match c.conclusion.as_deref() {
-        Some(conc) if is_passing(conc) => false,
-        Some(_) => true, // FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, etc.
-        None => false,
-    });
-    let has_pending = checks.iter().any(|c| c.conclusion.is_none());
-    let all_passed = checks.iter().all(|c| match c.conclusion.as_deref() {
-        Some(conc) => is_passing(conc),
-        None => false,
-    });
-
-    if has_failure {
-        "failed".to_string()
-    } else if all_passed {
-        "passed".to_string()
-    } else if has_pending {
-        "pending".to_string()
-    } else {
-        String::new()
-    }
-}
-
-/// Parse a PR JSON payload (gh CLI or native format) into validated PR data.
-/// Returns None when required fields are missing or invalid (caller: treat as stale).
-fn parse_pr_payload(json_str: &str) -> Option<PrCacheData> {
-    let pr: GhPrJson = serde_json::from_str(json_str).ok()?;
-    let check_status = compute_check_status(pr.status_check_rollup.as_deref());
-
-    #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
-    let number = match pr.number {
-        Some(n) if n > 0 => n as u32,
-        _ => return None,
-    };
-    let state = match pr.state {
-        Some(s) if !s.is_empty() => s,
-        _ => return None,
-    };
-    let url = match pr.url {
-        Some(u) if !u.is_empty() => u,
-        _ => return None,
-    };
-
-    // Prefer commentsCount (numeric) over comments array to avoid large allocations
-    #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
-    let comments = pr
-        .comments_count
-        .map(|c| c as u32)
-        .or_else(|| pr.comments.map(|c| c.len() as u32))
-        .unwrap_or(0);
-
-    #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
-    Some(PrCacheData {
-        number,
-        state,
-        url,
-        comments,
-        changed_files: pr.changed_files.unwrap_or(0) as u32,
-        check_status,
-    })
-}
-
-/// Load PR cache - reads file once and handles all states
-fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
-    let cache_path = get_pr_cache_path(repo_path, branch);
-    let Ok(content) = fs::read_to_string(&cache_path) else {
-        return PrCacheResult::Stale;
-    };
-    let Some(decoded) = decode_pr_cache(&content) else {
-        return PrCacheResult::Stale;
-    };
-
-    // Validate branch matches
-    if decoded.branch != branch {
-        let _ = fs::remove_file(&cache_path);
-        return PrCacheResult::Stale;
-    }
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age = now.saturating_sub(decoded.timestamp);
-    let payload = decoded.payload;
-
-    // NO_PR marker - negative cache with longer TTL
-    if payload == "NO_PR" {
-        if age < PR_NEGATIVE_CACHE_TTL {
-            return PrCacheResult::NoPr;
-        }
-        return PrCacheResult::Stale;
-    }
-
-    // ERROR marker - don't cache errors, always retry
-    if payload.starts_with("ERROR:") {
-        return PrCacheResult::Stale;
-    }
-
-    // Normal TTL
-    if age > PR_CACHE_TTL {
-        return PrCacheResult::Stale;
-    }
-
-    match parse_pr_payload(&payload) {
-        Some(data) => PrCacheResult::Hit(data),
-        None => PrCacheResult::Stale,
-    }
-}
-
-// ============================================================================
-// PR Fetch (background only)
-// ============================================================================
-
-/// Check if remote is GitHub
-/// Delegates to `parse_github_remote` which validates the origin URL as GitHub
-fn is_github_remote(git_dir: &str) -> bool {
-    parse_github_remote(git_dir).is_some()
-}
-
-/// Parse GitHub owner/repo from git remote URL
-/// Handles: git@github.com:owner/repo.git, <https://github.com/owner/repo.git>
-fn parse_github_remote(git_dir: &str) -> Option<(String, String)> {
-    // Use gix to get the common dir (handles worktrees automatically)
-    let common_dir = gix::open(git_dir).ok().map_or_else(
-        || Path::new(git_dir).to_path_buf(),
-        |repo| repo.common_dir().to_path_buf(),
-    );
-
-    let config_path = common_dir.join("config");
-    let content = fs::read_to_string(&config_path).ok()?;
-
-    // Find origin remote URL
-    let mut in_origin_section = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_origin_section = line == "[remote \"origin\"]";
-            continue;
-        }
-        // Handle various whitespace: "url = ", "url= ", "url=", "\turl = ", etc.
-        if in_origin_section
-            && let Some(url) = line
-                .strip_prefix("url")
-                .and_then(|s| s.trim_start().strip_prefix('='))
-                .map(str::trim)
-        {
-            return parse_github_url(url);
-        }
-    }
-    None
-}
-
 /// Generate a unique hex string for temp file names
 /// Uses timestamp + pid + atomic counter to avoid collisions within same process
-fn unique_hex() -> String {
+pub(crate) fn unique_hex() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -767,483 +348,73 @@ fn unique_hex() -> String {
     format!("{nanos:016x}{pid:08x}{count:04x}")
 }
 
-/// Spawn background process to refresh PR cache using gh CLI
-/// Uses atomic writes: write to temp file, then rename
-/// Distinguishes "no PR" from gh errors to avoid false negative caching
-/// Only available on Unix (requires sh shell)
-#[cfg(unix)]
-fn spawn_pr_refresh_gh(git_dir: &str, work_dir: &str, branch: &str) {
-    let cache_path = get_pr_cache_path(git_dir, branch);
-    let cache_path_str = cache_path.to_string_lossy();
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // Create temp files with random suffix in secure cache directory
-    let random_suffix = unique_hex();
-    let temp_cache = get_cache_dir().join(format!("pr-tmp-{random_suffix}.cache"));
-    let temp_cache_str = temp_cache.to_string_lossy();
-    let script_path = get_cache_dir().join(format!("pr-refresh-{random_suffix}.sh"));
-
-    // Script logic:
-    // 1. Run gh pr view and capture stdout/stderr separately
-    // 2. If gh succeeds with JSON output -> write PR data
-    // 3. If gh fails with "no pull requests" message -> write NO_PR (legitimate no PR)
-    // 4. If gh fails for other reasons -> write ERROR (don't negative cache)
-    // 5. Atomic rename temp file to cache file
-    // Uses trap with $0 for cleanup to avoid quoting issues with shell_escape
-    // ponytail: this printf must mirror encode_pr_cache's `timestamp\nbranch\npayload`
-    // layout by hand — it runs in a detached process and can't call back into Rust.
-    let script = format!(
-        r#"#!/bin/sh
-trap 'rm -f "$0"' EXIT
-cd {work_dir} || exit 1
-# Capture stdout and stderr separately to detect "no PR" vs other errors
-json=$(gh pr view --json number,state,url,comments,changedFiles,statusCheckRollup 2>/dev/null)
-exit_code=$?
-if [ $exit_code -eq 0 ] && [ -n "$json" ]; then
-    # Success with JSON output - PR exists
-    printf '%s\n%s\n%s' {timestamp} {branch} "$json" > {temp_cache}
-    mv -f {temp_cache} {cache_path}
-elif [ $exit_code -ne 0 ]; then
-    # gh failed - check if it's "no PR" error by running again and capturing stderr only
-    # Use file descriptor swap: redirect stdout to /dev/null first, then capture stderr
-    err=$(gh pr view 2>&1 1>/dev/null)
-    case "$err" in
-        *"no pull requests"*|*"no open pull requests"*|*"Could not resolve to a PullRequest"*)
-            # Legitimate "no PR" - negative cache
-            printf '%s\n%s\nNO_PR' {timestamp} {branch} > {temp_cache}
-            mv -f {temp_cache} {cache_path}
-            ;;
-        *)
-            # Other error (auth, network, etc) - don't negative cache
-            printf '%s\n%s\nERROR:%s' {timestamp} {branch} "$err" > {temp_cache}
-            mv -f {temp_cache} {cache_path}
-            ;;
-    esac
-fi
-"#,
-        work_dir = shell_escape(work_dir),
-        timestamp = now,
-        branch = shell_escape(branch),
-        temp_cache = shell_escape(&temp_cache_str),
-        cache_path = shell_escape(&cache_path_str),
-    );
-
-    if fs::write(&script_path, &script).is_err() {
-        return;
-    }
-
-    // Set executable permission
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
-    }
-
-    let _ = Command::new("sh")
-        .arg(&script_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct ClaudeInput {
+    pub(crate) cwd: Option<String>,
+    pub(crate) model: Model,
+    pub(crate) context_window: ContextWindow,
+    pub(crate) cost: Cost,
+    pub(crate) output_style: OutputStyle,
+    pub(crate) workspace: Workspace,
+    pub(crate) git: GitInput,
+    pub(crate) pr: PrInput,
 }
 
-/// Refresh PR cache using native HTTP (synchronous)
-/// Works on all platforms, no gh CLI required
-/// Note: Runs synchronously because threads don't survive process exit.
-/// First call may be slow (~500ms), but throttling ensures subsequent calls use cache.
-fn refresh_pr_native(git_dir: &str, branch: &str) {
-    // Get owner/repo from remote URL
-    let Some((owner, repo)) = parse_github_remote(git_dir) else {
-        return;
-    };
-
-    // Get auth token (may block on git credential helper)
-    let Some(token) = get_github_token() else {
-        return; // No auth, skip PR feature
-    };
-
-    fetch_pr_data_native(git_dir, branch, &owner, &repo, &token);
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Model {
+    pub(crate) display_name: Option<String>,
 }
 
-/// Fetch PR data using native HTTP (ureq)
-#[allow(clippy::too_many_lines)]
-fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, token: &str) {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let cache_path = get_pr_cache_path(git_dir, branch);
-
-    // GitHub API: GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=all
-    // Use state=all to show merged/closed PRs too (not just open)
-    // URL-encode the branch name to handle special characters like # or spaces
-    let encoded_branch = percent_encode(branch);
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{encoded_branch}&state=all"
-    );
-
-    let response = ureq::get(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "cc-statusline")
-        .set("X-GitHub-Api-Version", "2022-11-28")
-        .call();
-
-    let cache_content = match response {
-        Ok(resp) => {
-            let Ok(body) = resp.into_string() else {
-                return;
-            };
-
-            // Parse as array of PRs
-            let prs: Vec<serde_json::Value> = match serde_json::from_str(&body) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-
-            if prs.is_empty() {
-                // No PR for this branch - negative cache
-                encode_pr_cache(now, branch, "NO_PR")
-            } else {
-                // Found PR - convert to gh-compatible format
-                let pr = &prs[0];
-                let pr_number = pr["number"].as_u64().unwrap_or(0);
-                let pr_url = pr["html_url"].as_str().unwrap_or("");
-
-                // Fetch additional PR details (comments, check status)
-                let detail_url =
-                    format!("https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}");
-                let detail_resp = ureq::get(&detail_url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json")
-                    .set("User-Agent", "cc-statusline")
-                    .set("X-GitHub-Api-Version", "2022-11-28")
-                    .call();
-
-                let (comments_count, changed_files) = match detail_resp {
-                    Ok(resp) => {
-                        let body = resp.into_string().unwrap_or_default();
-                        let detail: serde_json::Value =
-                            serde_json::from_str(&body).unwrap_or_default();
-                        (
-                            detail["comments"].as_u64().unwrap_or(0)
-                                + detail["review_comments"].as_u64().unwrap_or(0),
-                            detail["changed_files"].as_u64().unwrap_or(0),
-                        )
-                    }
-                    Err(_) => (0, 0),
-                };
-
-                // Fetch check runs status
-                let checks_url = format!(
-                    "https://api.github.com/repos/{}/{}/commits/{}/check-runs",
-                    owner,
-                    repo,
-                    pr["head"]["sha"].as_str().unwrap_or("")
-                );
-                let checks_resp = ureq::get(&checks_url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json")
-                    .set("User-Agent", "cc-statusline")
-                    .set("X-GitHub-Api-Version", "2022-11-28")
-                    .call();
-
-                let check_rollup: Vec<serde_json::Value> = match checks_resp {
-                    Ok(resp) => {
-                        let body = resp.into_string().unwrap_or_default();
-                        let checks: serde_json::Value =
-                            serde_json::from_str(&body).unwrap_or_default();
-                        checks["check_runs"]
-                            .as_array()
-                            .map(|runs| {
-                                runs.iter()
-                                    .map(|run| {
-                                        serde_json::json!({
-                                            "conclusion": run["conclusion"]
-                                        })
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    }
-                    Err(_) => vec![],
-                };
-
-                // Build cache JSON - use commentsCount (number) instead of comments array
-                // to avoid large allocations when deserializing
-                let gh_json = serde_json::json!({
-                    "number": pr_number,
-                    "state": pr["state"],
-                    "url": pr_url,
-                    "commentsCount": comments_count,
-                    "changedFiles": changed_files,
-                    "statusCheckRollup": check_rollup
-                });
-
-                encode_pr_cache(now, branch, &gh_json.to_string())
-            }
-        }
-        Err(ureq::Error::Status(code, _)) => {
-            // API error (401/403/404 etc) - don't negative cache
-            // Note: 404 can mean "no access" for private repos, not just "no PR"
-            encode_pr_cache(now, branch, &format!("ERROR:HTTP {code}"))
-        }
-        Err(e) => {
-            // Network error - don't negative cache
-            encode_pr_cache(now, branch, &format!("ERROR:{e}"))
-        }
-    };
-
-    // Atomic write to cache
-    let temp_path = get_cache_dir().join(format!("pr-tmp-{}.cache", unique_hex()));
-    if fs::write(&temp_path, &cache_content).is_ok() {
-        let _ = atomic_rename(&temp_path, &cache_path);
-    }
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct ContextWindow {
+    pub(crate) remaining_percentage: Option<f64>,
+    pub(crate) total_input_tokens: Option<u64>,
+    pub(crate) total_output_tokens: Option<u64>,
 }
 
-/// Dispatch PR refresh to appropriate implementation
-/// Returns true if refresh was synchronous (cache can be re-read immediately)
-fn spawn_pr_refresh(git_dir: &str, work_dir: &str, branch: &str) -> bool {
-    // Only proceed if this is a GitHub repo
-    if !is_github_remote(git_dir) {
-        return false;
-    }
-
-    // On Unix, prefer gh if available (handles auth, rate limits better)
-    #[cfg(unix)]
-    if is_gh_available() {
-        spawn_pr_refresh_gh(git_dir, work_dir, branch);
-        return false; // Background process, cache not ready yet
-    }
-
-    // Fallback to native HTTP (works on all platforms, no gh required)
-    refresh_pr_native(git_dir, branch);
-    true // Synchronous, cache is ready
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Cost {
+    pub(crate) total_duration_ms: Option<u64>,
 }
 
-/// Check if we should skip refresh (throttled or negative cache)
-fn should_skip_refresh(git_dir: &str, branch: &str) -> bool {
-    let attempt_path = get_pr_attempt_path(git_dir, branch);
-    if let Ok(metadata) = fs::metadata(&attempt_path)
-        && let Ok(mtime) = metadata.modified()
-    {
-        let now = SystemTime::now();
-        if let Ok(elapsed) = now.duration_since(mtime) {
-            // Skip if we attempted recently
-            return elapsed.as_secs() < PR_REFRESH_THROTTLE;
-        }
-    }
-    false
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct OutputStyle {
+    pub(crate) name: Option<String>,
 }
 
-/// Mark that we've attempted a refresh
-fn mark_refresh_attempt(git_dir: &str, branch: &str) {
-    let attempt_path = get_pr_attempt_path(git_dir, branch);
-    // Atomic write (Windows-compatible)
-    let temp_path = get_cache_dir().join(format!("pr-attempt-tmp-{}", unique_hex()));
-    if fs::write(&temp_path, "").is_ok() {
-        let _ = atomic_rename(&temp_path, &attempt_path);
-    }
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Workspace {
+    pub(crate) project_dir: Option<String>,
+    pub(crate) current_dir: Option<String>,
 }
 
-/// Get PR data - checks cache first, triggers refresh if needed
-/// On Unix with gh CLI: spawns background process (non-blocking)
-/// On other platforms or without gh: runs synchronous HTTP refresh (may block ~500ms)
-fn get_pr_data(git: &GitRepo) -> Option<PrCacheData> {
-    // Single cache read handles all states
-    match load_pr_cache(&git.git_dir, &git.branch) {
-        PrCacheResult::Hit(data) => return Some(data),
-        PrCacheResult::NoPr => return None, // Negative cache hit - no PR exists
-        PrCacheResult::Stale => {}          // Continue to refresh
-    }
-
-    // Throttle refresh attempts to avoid process storms
-    if should_skip_refresh(&git.git_dir, &git.branch) {
-        return None;
-    }
-
-    // Mark that we're attempting a refresh
-    mark_refresh_attempt(&git.git_dir, &git.branch);
-
-    // Trigger refresh - returns true if synchronous (native path)
-    let was_synchronous = spawn_pr_refresh(&git.git_dir, &git.work_dir, &git.branch);
-
-    // If refresh was synchronous, re-read cache to return data immediately
-    // This avoids blocking on HTTP but still not showing PR data until next render
-    if was_synchronous && let PrCacheResult::Hit(data) = load_pr_cache(&git.git_dir, &git.branch) {
-        return Some(data);
-    }
-
-    None
+/// Git info from JSON input (for screenshots/testing)
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct GitInput {
+    pub(crate) branch: Option<String>,
+    pub(crate) worktree: Option<String>,
+    pub(crate) changed_files: Option<u32>,
+    pub(crate) ahead: Option<u32>,
+    pub(crate) behind: Option<u32>,
 }
 
-/// Holds repository state for lazy evaluation of expensive git operations
-struct GitRepo {
-    repo: Repository,
-    branch: String,
-    worktree: Option<String>,
-    git_dir: String,
-    work_dir: String,
-}
-
-impl GitRepo {
-    /// Compute diff stats using git index - simplified, just count modified files
-    fn diff_stats(&self) -> Option<(u32, u32, u32)> {
-        let index = self.repo.index().ok()?;
-        let workdir = self.repo.work_dir()?;
-        let mut files = 0u32;
-
-        for entry in index.entries() {
-            let path_bstr = entry.path(&index);
-            let path_str = std::str::from_utf8(path_bstr.as_ref()).ok()?;
-            let file_path = workdir.join(path_str);
-
-            if let Ok(metadata) = fs::metadata(&file_path) {
-                let mtime = metadata
-                    .modified()
-                    .ok()?
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()?
-                    .as_secs();
-                let index_mtime = u64::from(entry.stat.mtime.secs);
-
-                if mtime != index_mtime {
-                    files += 1;
-                }
-            } else {
-                files += 1; // File deleted
-            }
-        }
-
-        // gix doesn't easily give line counts, so just return file count
-        Some((files, 0, 0))
-    }
-
-    /// Get index mtime for cache invalidation
-    fn index_mtime(&self) -> u64 {
-        let index_path = format!("{}/index", self.git_dir.trim_end_matches('/'));
-        fs::metadata(&index_path)
-            .and_then(|m| m.modified())
-            .map(|t| {
-                t.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            })
-            .unwrap_or(0)
-    }
-
-    /// Get HEAD oid for cache invalidation
-    fn head_oid(&self) -> String {
-        let ref_path = format!(
-            "{}/refs/heads/{}",
-            self.git_dir.trim_end_matches('/'),
-            self.branch
-        );
-        if let Ok(oid) = fs::read_to_string(&ref_path) {
-            return oid.trim().to_string();
-        }
-        self.repo
-            .head_id()
-            .map(|id| id.to_string())
-            .unwrap_or_default()
-    }
-}
-
-fn get_cache_path(git_dir: &str) -> PathBuf {
-    get_cache_dir().join(format!("status-{:016x}.cache", hash_path(git_dir)))
-}
-
-fn load_mmap_cache(git_dir: &str) -> Option<MmapCache> {
-    let cache_path = get_cache_path(git_dir);
-    let file = OpenOptions::new().read(true).open(&cache_path).ok()?;
-    let mmap = unsafe { MmapOptions::new().map(&file).ok()? };
-    MmapCache::from_bytes(&mmap)
-}
-
-fn save_mmap_cache(git_dir: &str, cache: &MmapCache) {
-    let cache_path = get_cache_path(git_dir);
-    // Atomic write: write to temp file, then rename
-    let temp_path = get_cache_dir().join(format!("status-tmp-{}.cache", unique_hex()));
-
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)
-    else {
-        return;
-    };
-    if file.set_len(CACHE_SIZE as u64).is_err() {
-        let _ = fs::remove_file(&temp_path);
-        return;
-    }
-    let Ok(mut mmap) = (unsafe { MmapMut::map_mut(&file) }) else {
-        let _ = fs::remove_file(&temp_path);
-        return;
-    };
-    cache.to_bytes(&mut mmap);
-    if mmap.flush().is_err() {
-        let _ = fs::remove_file(&temp_path);
-        return;
-    }
-    drop(mmap);
-    drop(file);
-    let _ = atomic_rename(&temp_path, &cache_path);
-}
-
-struct GitPathCache {
-    git_path: String,
-    branch: String,
-}
-
-fn get_head_mtime(git_path: &str) -> u64 {
-    let head_path = format!("{}/HEAD", git_path.trim_end_matches('/'));
-    fs::metadata(&head_path)
-        .and_then(|m| m.modified())
-        .map(|t| {
-            t.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
-        .unwrap_or(0)
-}
-
-fn get_cached_git_info(working_dir: &str) -> Option<GitPathCache> {
-    let cache_path = get_cache_dir().join(format!("gitpath-{:016x}.cache", hash_path(working_dir)));
-    let content = fs::read_to_string(&cache_path).ok()?;
-    let mut lines = content.lines();
-
-    let git_path = lines.next()?.to_string();
-    let branch = lines.next()?.to_string();
-    let cached_mtime: u64 = lines.next()?.parse().ok()?;
-
-    if !Path::new(&git_path).exists() {
-        let _ = fs::remove_file(&cache_path);
-        return None;
-    }
-
-    let current_mtime = get_head_mtime(&git_path);
-    if current_mtime != cached_mtime {
-        return None;
-    }
-
-    Some(GitPathCache { git_path, branch })
-}
-
-fn cache_git_info(working_dir: &str, git_path: &str, branch: &str) {
-    let cache_path = get_cache_dir().join(format!("gitpath-{:016x}.cache", hash_path(working_dir)));
-    let head_mtime = get_head_mtime(git_path);
-    let content = format!("{git_path}\n{branch}\n{head_mtime}");
-    // Atomic write (Windows-compatible): write to temp, then rename
-    let temp_path = get_cache_dir().join(format!("gitpath-tmp-{}.cache", unique_hex()));
-    if fs::write(&temp_path, &content).is_ok() {
-        let _ = atomic_rename(&temp_path, &cache_path);
-    }
+/// PR info from JSON input (for screenshots/testing)
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct PrInput {
+    pub(crate) number: Option<u32>,
+    pub(crate) state: Option<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) comments: Option<u32>,
+    pub(crate) changed_files: Option<u32>,
+    pub(crate) check_status: Option<String>,
 }
 
 fn main() {
@@ -1320,553 +491,12 @@ fn main() {
     out.flush().unwrap_or_default();
 }
 
-/// Detect linked worktree name from `git_dir` path
-fn get_worktree_name(git_dir: &str) -> Option<String> {
-    // Linked worktrees have git_dir like: /path/.git/worktrees/<name>
-    if let Some(idx) = git_dir.find("/.git/worktrees/") {
-        let name = &git_dir[idx + 16..]; // skip "/.git/worktrees/"
-        let name = name.trim_end_matches('/');
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
-fn get_git_repo(dir: &str) -> Option<GitRepo> {
-    // Try cache first
-    if let Some(cache) = get_cached_git_info(dir) {
-        let repo = gix::open(&cache.git_path).ok()?;
-        let work_dir = repo
-            .work_dir()
-            .map_or_else(|| dir.to_string(), |p| p.to_string_lossy().into_owned());
-        let worktree = get_worktree_name(&cache.git_path);
-        return Some(GitRepo {
-            repo,
-            branch: cache.branch,
-            worktree,
-            git_dir: cache.git_path,
-            work_dir,
-        });
-    }
-
-    // Discover repo
-    let repo = gix::discover(dir).ok()?;
-    let git_dir = repo.git_dir().to_string_lossy().into_owned();
-    let work_dir = repo
-        .work_dir()
-        .map_or_else(|| dir.to_string(), |p| p.to_string_lossy().into_owned());
-
-    // Get branch name from HEAD
-    let head = repo.head().ok()?;
-    let branch = head
-        .referent_name()
-        .map_or_else(|| "HEAD".to_string(), |n| n.shorten().to_string());
-
-    let worktree = get_worktree_name(&git_dir);
-
-    cache_git_info(dir, &git_dir, &branch);
-    Some(GitRepo {
-        repo,
-        branch,
-        worktree,
-        git_dir,
-        work_dir,
-    })
-}
-
-/// Find the configured upstream ref for a branch
-/// Reads branch.<name>.remote and branch.<name>.merge from git config
-fn find_upstream_ref(repo: &gix::Repository, branch: &str) -> Option<String> {
-    let config = repo.config_snapshot();
-
-    // Get branch.<name>.remote (e.g., "origin")
-    let remote_key = format!("branch.{branch}.remote");
-    let remote = config.string(remote_key.as_str())?;
-    let remote = remote.to_string();
-
-    // Get branch.<name>.merge (e.g., "refs/heads/main")
-    let merge_key = format!("branch.{branch}.merge");
-    let merge_ref = config.string(merge_key.as_str())?;
-    let merge_ref = merge_ref.to_string();
-
-    // Convert refs/heads/X to refs/remotes/<remote>/X
-    let upstream_branch = merge_ref.strip_prefix("refs/heads/")?;
-    Some(format!("refs/remotes/{remote}/{upstream_branch}"))
-}
-
-/// Get ahead/behind counts relative to upstream using gix
-fn get_ahead_behind(repo: &gix::Repository, branch: &str) -> (u32, u32) {
-    // Get HEAD commit
-    let Ok(head_id) = repo.head_id() else {
-        return (0, 0);
-    };
-
-    // Try to find configured upstream for this branch first
-    // Falls back to origin/<branch> if no upstream configured
-    let upstream_ref =
-        find_upstream_ref(repo, branch).unwrap_or_else(|| format!("refs/remotes/origin/{branch}"));
-
-    let upstream_id = match repo.find_reference(&upstream_ref) {
-        Ok(r) => match r.into_fully_peeled_id() {
-            Ok(id) => id,
-            Err(_) => return (0, 0),
-        },
-        Err(_) => return (0, 0), // No upstream
-    };
-
-    // If same commit, no ahead/behind
-    if head_id == upstream_id {
-        return (0, 0);
-    }
-
-    // Count commits reachable from HEAD but not upstream (ahead)
-    let ahead = count_commits_not_in(repo, head_id.detach(), upstream_id.detach());
-    // Count commits reachable from upstream but not HEAD (behind)
-    let behind = count_commits_not_in(repo, upstream_id.detach(), head_id.detach());
-
-    (ahead, behind)
-}
-
-/// Count commits reachable from `from` but not from `exclude`
-///
-/// Note: Uses a 10k commit safety limit to prevent runaway computation in very large repos.
-/// In repos with >10k commits between branches, counts may be approximate. This is an
-/// intentional trade-off for predictable performance in a status line tool.
-fn count_commits_not_in(
-    repo: &gix::Repository,
-    from: gix::ObjectId,
-    exclude: gix::ObjectId,
-) -> u32 {
-    // First, collect all commits reachable from exclude (the "stop" set)
-    let mut exclude_set = std::collections::HashSet::new();
-    let Ok(exclude_iter) = repo.rev_walk([exclude]).all() else {
-        return 0;
-    };
-    for info in exclude_iter {
-        let Ok(info) = info else { break };
-        exclude_set.insert(info.id);
-        if exclude_set.len() > 10000 {
-            break; // Safety limit
-        }
-    }
-
-    // Now count commits from `from` that aren't in exclude_set
-    // Don't break on first intersection - merges can have commits on both sides
-    let Ok(from_iter) = repo.rev_walk([from]).all() else {
-        return 0;
-    };
-    let mut count = 0u32;
-    let mut visited = 0u32;
-    for info in from_iter {
-        let Ok(info) = info else { break };
-        visited += 1;
-        if !exclude_set.contains(&info.id) {
-            count += 1;
-        }
-        if visited > 10000 {
-            break; // Safety limit
-        }
-    }
-    count
-}
-
-fn compute_and_cache_git_stats(git: &GitRepo, mtime: u64, oid: &str) -> (u32, u32, u32) {
-    let (files_changed, lines_added, lines_deleted) = git.diff_stats().unwrap_or((0, 0, 0));
-
-    let oid_bytes = oid.as_bytes();
-    let copy_len = oid_bytes.len().min(40);
-    let mut head_oid = [0u8; 40];
-    head_oid[..copy_len].copy_from_slice(&oid_bytes[..copy_len]);
-
-    let cache = MmapCache {
-        index_mtime: mtime,
-        head_oid,
-        files_changed,
-        lines_added,
-        lines_deleted,
-        ahead: 0,
-        behind: 0,
-    };
-    save_mmap_cache(&git.git_dir, &cache);
-
-    (files_changed, lines_added, lines_deleted)
-}
-
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        let tenths = n / 100_000;
-        let whole = tenths / 10;
-        let frac = tenths % 10;
-        format!("{whole}.{frac}M")
-    } else if n >= 1_000 {
-        format!("{}K", n / 1_000)
-    } else {
-        format!("{n}")
-    }
-}
-
-// ============================================================================
-// Config-driven rendering
-// ============================================================================
-
-/// Plain, fully-resolved data the status line renders from.
-///
-/// This is the seam: `gather` does all I/O (git, PR fetch, hostname) and produces
-/// a `StatusView`; `render_component` consumes one and touches nothing else. Tests
-/// build a `StatusView` literal and assert exact output — no process spawn, no git,
-/// no network.
-struct StatusView {
-    hostname: Option<String>,
-    project_name: String,
-    display_cwd: String,
-    branch: Option<String>,
-    worktree: Option<String>,
-    files_changed: u32,
-    ahead: u32,
-    behind: u32,
-    pr: Option<PrCacheData>,
-    model: Option<String>,
-    context_pct: Option<f64>,
-    output_style: Option<String>,
-    duration_ms: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-}
-
-/// Resolve a `StatusView` from input and the discovered repo, running all I/O here.
-fn gather(data: &ClaudeInput, current_dir: &str, git: Option<&GitRepo>) -> StatusView {
-    let project_name = data
-        .workspace
-        .project_dir
-        .as_ref()
-        .and_then(|p| Path::new(p).file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    let home = get_home();
-    let display_cwd = if !home.is_empty() && current_dir.starts_with(home) {
-        format!("~{}", &current_dir[home.len()..])
-    } else {
-        current_dir.to_string()
-    };
-
-    let hostname = if is_ssh_session() {
-        get_hostname().cloned()
-    } else {
-        None
-    };
-
-    // Compute git stats upfront if we have a git repo and no JSON override
-    let (files_changed, ahead, behind) = if data.git.branch.is_some() {
-        // Using JSON input
-        (
-            data.git.changed_files.unwrap_or(0),
-            data.git.ahead.unwrap_or(0),
-            data.git.behind.unwrap_or(0),
-        )
-    } else if let Some(g) = git {
-        let cache = load_mmap_cache(&g.git_dir);
-        let current_mtime = g.index_mtime();
-        let current_oid = g.head_oid();
-
-        let (files, _, _) = if let Some(ref c) = cache {
-            if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
-                (c.files_changed, c.lines_added, c.lines_deleted)
-            } else {
-                compute_and_cache_git_stats(g, current_mtime, &current_oid)
-            }
-        } else {
-            compute_and_cache_git_stats(g, current_mtime, &current_oid)
-        };
-
-        let (ahead, behind) = get_ahead_behind(&g.repo, &g.branch);
-        (files, ahead, behind)
-    } else {
-        (0, 0, 0)
-    };
-
-    // Get PR data
-    let pr = if data.pr.number.is_some() {
-        // Using JSON input
-        Some(PrCacheData {
-            number: data.pr.number.unwrap_or(0),
-            state: data.pr.state.clone().unwrap_or_default(),
-            url: data.pr.url.clone().unwrap_or_default(),
-            comments: data.pr.comments.unwrap_or(0),
-            changed_files: data.pr.changed_files.unwrap_or(0),
-            check_status: data.pr.check_status.clone().unwrap_or_default(),
-        })
-    } else {
-        git.and_then(get_pr_data)
-    };
-
-    let branch = data
-        .git
-        .branch
-        .clone()
-        .or_else(|| git.map(|g| g.branch.clone()));
-    let worktree = data
-        .git
-        .worktree
-        .clone()
-        .or_else(|| git.and_then(|g| g.worktree.clone()));
-
-    StatusView {
-        hostname,
-        project_name,
-        display_cwd,
-        branch,
-        worktree,
-        files_changed,
-        ahead,
-        behind,
-        pr,
-        model: data.model.display_name.clone(),
-        context_pct: data.context_window.remaining_percentage,
-        output_style: data.output_style.name.clone(),
-        duration_ms: data.cost.total_duration_ms.unwrap_or(0),
-        input_tokens: data.context_window.total_input_tokens.unwrap_or(0),
-        output_tokens: data.context_window.total_output_tokens.unwrap_or(0),
-    }
-}
-
-/// Render a single component, returning colored output string or None if no data
-fn render_component(name: &str, view: &StatusView) -> Option<String> {
-    match name {
-        "hostname" => view
-            .hostname
-            .as_ref()
-            .map(|h| format!("{TN_GREEN}{h}{RESET}")),
-
-        "project" => {
-            if view.project_name.is_empty() {
-                None
-            } else {
-                Some(format!("{TN_BLUE}{}{RESET}", view.project_name))
-            }
-        }
-
-        "path" => {
-            // Use a conservative width for path abbreviation
-            // Since config allows placing path on any row, we can't know what other
-            // components share the row. Use ~60% of terminal width as a reasonable default.
-            let path_width = (TERM_WIDTH * 3 / 5).max(20);
-            let abbrev = abbreviate_path(&view.display_cwd, path_width);
-            Some(format!("{TN_CYAN}{abbrev}{RESET}"))
-        }
-
-        "branch" => view
-            .branch
-            .as_deref()
-            .map(|b| format!("{TN_PURPLE}{b}{RESET}")),
-
-        // Shows "no git" when there's no branch (not in a git repo)
-        "no_git" => {
-            if view.branch.is_none() {
-                Some(format!("{TN_GRAY}no git{RESET}"))
-            } else {
-                None
-            }
-        }
-
-        "worktree" => view
-            .worktree
-            .as_deref()
-            .map(|wt| format!("{TN_MAGENTA}{wt}{RESET}")),
-
-        "files" => {
-            let files = view.files_changed;
-            if files > 0 {
-                Some(format!("{TN_GRAY}{files} files{RESET}"))
-            } else {
-                None
-            }
-        }
-
-        "ahead_behind" => {
-            let (ahead, behind) = (view.ahead, view.behind);
-            if ahead > 0 || behind > 0 {
-                let mut s = String::new();
-                if ahead > 0 {
-                    s.push_str(&format!("{TN_GRAY}↑{ahead}{RESET}"));
-                }
-                if behind > 0 {
-                    if ahead > 0 {
-                        s.push(' ');
-                    }
-                    s.push_str(&format!("{TN_GRAY}↓{behind}{RESET}"));
-                }
-                Some(s)
-            } else {
-                None
-            }
-        }
-
-        "pr_number" => {
-            let pr = view.pr.as_ref()?;
-            if pr.url.is_empty() {
-                Some(format!("{TN_CYAN}#{}{RESET}", pr.number))
-            } else {
-                Some(format!(
-                    "{OSC8_START}{}{OSC8_MID}{TN_CYAN}#{}{RESET}{OSC8_END}",
-                    pr.url, pr.number
-                ))
-            }
-        }
-
-        "pr_state" => {
-            let pr = view.pr.as_ref()?;
-            let state_lower = pr.state.to_lowercase();
-            let color = match state_lower.as_str() {
-                "open" => TN_GREEN,
-                "merged" => TN_PURPLE,
-                "closed" => TN_RED,
-                _ => TN_GRAY,
-            };
-            Some(format!("{color}{state_lower}{RESET}"))
-        }
-
-        "pr_comments" => {
-            let pr = view.pr.as_ref()?;
-            if pr.comments > 0 {
-                let label = if pr.comments == 1 {
-                    "comment"
-                } else {
-                    "comments"
-                };
-                Some(format!("{TN_GRAY}{} {label}{RESET}", pr.comments))
-            } else {
-                None
-            }
-        }
-
-        "pr_files" => {
-            let pr = view.pr.as_ref()?;
-            if pr.changed_files > 0 {
-                let label = if pr.changed_files == 1 {
-                    "file"
-                } else {
-                    "files"
-                };
-                Some(format!("{TN_GRAY}{} {label}{RESET}", pr.changed_files))
-            } else {
-                None
-            }
-        }
-
-        "pr_checks" => {
-            let pr = view.pr.as_ref()?;
-            let checks_url = if pr.url.is_empty() {
-                String::new()
-            } else {
-                format!("{}/checks", pr.url)
-            };
-            match pr.check_status.trim() {
-                "passed" if !checks_url.is_empty() => Some(format!(
-                    "{OSC8_START}{checks_url}{OSC8_MID}{TN_GREEN}checks passed{RESET}{OSC8_END}"
-                )),
-                "failed" if !checks_url.is_empty() => Some(format!(
-                    "{OSC8_START}{checks_url}{OSC8_MID}{TN_RED}checks failed{RESET}{OSC8_END}"
-                )),
-                "pending" if !checks_url.is_empty() => Some(format!(
-                    "{OSC8_START}{checks_url}{OSC8_MID}{TN_ORANGE}checks pending{RESET}{OSC8_END}"
-                )),
-                "passed" => Some(format!("{TN_GREEN}checks passed{RESET}")),
-                "failed" => Some(format!("{TN_RED}checks failed{RESET}")),
-                "pending" => Some(format!("{TN_ORANGE}checks pending{RESET}")),
-                _ => None,
-            }
-        }
-
-        "model" => {
-            if let Some(model) = &view.model
-                && model != "Unknown"
-            {
-                return Some(format!("{TN_ORANGE}{model}{RESET}"));
-            }
-            None
-        }
-
-        "context" => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pct = view.context_pct.unwrap_or(100.0) as u32;
-            if pct < 100 {
-                Some(format!("{TN_TEAL}{pct}%{RESET}"))
-            } else {
-                None
-            }
-        }
-
-        "style" => {
-            if let Some(mode) = &view.output_style
-                && mode != "default"
-            {
-                return Some(format!("{TN_BLUE}{mode}{RESET}"));
-            }
-            None
-        }
-
-        "duration" => {
-            let ms = view.duration_ms;
-            if ms > 0 {
-                let total_secs = ms / 1000;
-                let mins = total_secs / 60;
-                let hours = mins / 60;
-                let mins = mins % 60;
-                if hours > 0 {
-                    Some(format!("{TN_GRAY}{hours}h {mins}m{RESET}"))
-                } else {
-                    Some(format!("{TN_GRAY}{mins}m{RESET}"))
-                }
-            } else {
-                None
-            }
-        }
-
-        "tokens" => {
-            let input = view.input_tokens;
-            let output = view.output_tokens;
-            if input > 0 || output > 0 {
-                Some(format!(
-                    "{TN_GRAY}{}/{}{RESET}",
-                    format_tokens(input),
-                    format_tokens(output)
-                ))
-            } else {
-                None
-            }
-        }
-
-        _ => None, // Unknown component - ignore silently for forward compatibility
-    }
-}
-
-/// Write all rows according to config
-fn write_rows<W: Write>(out: &mut W, config: &Config, view: &StatusView) {
-    for row_components in &config.rows {
-        if row_components.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<String> = row_components
-            .iter()
-            .filter_map(|name| render_component(name, view))
-            .collect();
-
-        if !parts.is_empty() {
-            writeln!(out, "{}", parts.join(SEP)).unwrap_or_default();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // =========================================================================
-    // hash_path tests
-    // =========================================================================
+    // These exercise the pure helpers re-exported from the library crate.
+    use cc_statusline::{
+        abbreviate_path, hash_path, parse_github_url, percent_encode, shell_escape,
+    };
 
     #[test]
     fn hash_path_deterministic() {
@@ -1876,9 +506,10 @@ mod tests {
 
     #[test]
     fn hash_path_different_inputs() {
-        let path1 = "/home/user/project1";
-        let path2 = "/home/user/project2";
-        assert_ne!(hash_path(path1), hash_path(path2));
+        assert_ne!(
+            hash_path("/home/user/project1"),
+            hash_path("/home/user/project2")
+        );
     }
 
     #[test]
@@ -1893,10 +524,6 @@ mod tests {
         assert_ne!(hash_path("/a/b/c"), hash_path("/a/b/d"));
     }
 
-    // =========================================================================
-    // parse_github_url tests
-    // =========================================================================
-
     #[test]
     fn parse_ssh_url() {
         let result = parse_github_url("git@github.com:owner/repo.git");
@@ -1905,7 +532,6 @@ mod tests {
 
     #[test]
     fn parse_ssh_url_without_git_suffix() {
-        // SSH URLs sometimes don't have .git suffix
         let result = parse_github_url("git@github.com:owner/repo");
         assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
     }
@@ -1976,15 +602,10 @@ mod tests {
         assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
     }
 
-    // =========================================================================
-    // abbreviate_path tests
-    // =========================================================================
-
     #[test]
     fn path_within_width_unchanged() {
         let path = "~/short";
-        let result = abbreviate_path(path, 50);
-        assert_eq!(result.as_ref(), path);
+        assert_eq!(abbreviate_path(path, 50).as_ref(), path);
     }
 
     #[test]
@@ -1999,96 +620,75 @@ mod tests {
     #[test]
     fn single_segment_path() {
         let path = "project";
-        let result = abbreviate_path(path, 5);
         // Single segment can't be abbreviated further
-        assert_eq!(result.as_ref(), path);
+        assert_eq!(abbreviate_path(path, 5).as_ref(), path);
     }
 
     #[test]
     fn root_path() {
         let path = "/";
-        let result = abbreviate_path(path, 50);
-        assert_eq!(result.as_ref(), path);
+        assert_eq!(abbreviate_path(path, 50).as_ref(), path);
     }
 
     #[test]
     fn two_segment_path() {
         let path = "~/project";
-        let result = abbreviate_path(path, 5);
         // Should keep both segments as much as possible
-        assert!(result.contains("project"));
+        assert!(abbreviate_path(path, 5).contains("project"));
     }
 
     #[test]
     fn tilde_home_preserved() {
         let path = "~/a/b/c/d/project";
-        let result = abbreviate_path(path, 20);
         // Tilde should be preserved as first char abbreviation
-        assert!(result.starts_with('~'));
+        assert!(abbreviate_path(path, 20).starts_with('~'));
     }
-
-    // =========================================================================
-    // shell_escape tests
-    // =========================================================================
 
     #[test]
     fn shell_escape_single_quotes() {
-        let result = shell_escape("it's a test");
-        assert_eq!(result, "'it'\\''s a test'");
+        assert_eq!(shell_escape("it's a test"), "'it'\\''s a test'");
     }
 
     #[test]
     fn shell_escape_empty_string() {
-        let result = shell_escape("");
-        assert_eq!(result, "''");
+        assert_eq!(shell_escape(""), "''");
     }
 
     #[test]
     fn shell_escape_no_escape_needed() {
-        let result = shell_escape("simple");
-        assert_eq!(result, "'simple'");
+        assert_eq!(shell_escape("simple"), "'simple'");
     }
 
     #[test]
     fn shell_escape_special_chars() {
         // Special shell characters should be safely escaped inside single quotes
-        let result = shell_escape("$HOME && rm -rf /");
-        assert_eq!(result, "'$HOME && rm -rf /'");
+        assert_eq!(shell_escape("$HOME && rm -rf /"), "'$HOME && rm -rf /'");
     }
 
     #[test]
     fn shell_escape_multiple_quotes() {
-        let result = shell_escape("it's Bob's");
-        assert_eq!(result, "'it'\\''s Bob'\\''s'");
+        assert_eq!(shell_escape("it's Bob's"), "'it'\\''s Bob'\\''s'");
     }
-
-    // =========================================================================
-    // percent_encode tests
-    // =========================================================================
 
     #[test]
     fn percent_encode_spaces() {
-        let result = percent_encode("hello world");
-        assert_eq!(result, "hello%20world");
+        assert_eq!(percent_encode("hello world"), "hello%20world");
     }
 
     #[test]
     fn percent_encode_special_chars() {
-        let result = percent_encode("test#branch");
-        assert_eq!(result, "test%23branch");
+        assert_eq!(percent_encode("test#branch"), "test%23branch");
     }
 
     #[test]
     fn percent_encode_unreserved_chars_unchanged() {
         // RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
-        let result = percent_encode("azAZ09-._~");
-        assert_eq!(result, "azAZ09-._~");
+        assert_eq!(percent_encode("azAZ09-._~"), "azAZ09-._~");
     }
 
     #[test]
     fn percent_encode_slash() {
-        let result = percent_encode("path/to/file");
-        assert_eq!(result, "path%2Fto%2Ffile");
+        assert_eq!(percent_encode("path/to/file"), "path%2Fto%2Ffile");
     }
 
     #[test]
@@ -2101,351 +701,6 @@ mod tests {
 
     #[test]
     fn percent_encode_empty() {
-        let result = percent_encode("");
-        assert_eq!(result, "");
-    }
-
-    // =========================================================================
-    // MmapCache tests
-    // =========================================================================
-
-    #[test]
-    fn cache_round_trip() {
-        let original = MmapCache {
-            index_mtime: 1234567890,
-            head_oid: *b"abc123def456abc123def456abc123def4567890",
-            files_changed: 42,
-            lines_added: 100,
-            lines_deleted: 50,
-            ahead: 3,
-            behind: 5,
-        };
-
-        let mut buf = [0u8; CACHE_SIZE];
-        original.to_bytes(&mut buf);
-
-        let loaded = MmapCache::from_bytes(&buf).expect("should parse");
-        assert_eq!(loaded.index_mtime, original.index_mtime);
-        assert_eq!(loaded.head_oid, original.head_oid);
-        assert_eq!(loaded.files_changed, original.files_changed);
-        assert_eq!(loaded.lines_added, original.lines_added);
-        assert_eq!(loaded.lines_deleted, original.lines_deleted);
-        assert_eq!(loaded.ahead, original.ahead);
-        assert_eq!(loaded.behind, original.behind);
-    }
-
-    #[test]
-    fn cache_invalid_magic() {
-        let mut buf = [0u8; CACHE_SIZE];
-        buf[0..4].copy_from_slice(b"XXXX"); // Wrong magic
-        assert!(MmapCache::from_bytes(&buf).is_none());
-    }
-
-    #[test]
-    fn cache_wrong_version() {
-        let mut buf = [0u8; CACHE_SIZE];
-        buf[0..4].copy_from_slice(CACHE_MAGIC);
-        buf[4..8].copy_from_slice(&99u32.to_le_bytes()); // Wrong version
-        assert!(MmapCache::from_bytes(&buf).is_none());
-    }
-
-    #[test]
-    fn cache_truncated() {
-        let buf = [0u8; 10]; // Too small
-        assert!(MmapCache::from_bytes(&buf).is_none());
-    }
-
-    #[test]
-    fn cache_head_oid_matches_prefix() {
-        let cache = MmapCache {
-            head_oid: *b"abc123def456abc123def456abc123def4567890",
-            ..Default::default()
-        };
-
-        // Full match
-        assert!(cache.head_oid_matches("abc123def456abc123def456abc123def4567890"));
-        // Prefix match (short oid)
-        assert!(cache.head_oid_matches("abc123"));
-        assert!(cache.head_oid_matches("abc123def456"));
-        // No match
-        assert!(!cache.head_oid_matches("xyz"));
-        assert!(!cache.head_oid_matches("abc124")); // Different character
-    }
-
-    #[test]
-    fn cache_head_oid_empty_matches() {
-        let cache = MmapCache::default();
-        // Empty oid should match empty string
-        assert!(cache.head_oid_matches(""));
-    }
-
-    // =========================================================================
-    // format_tokens tests
-    // =========================================================================
-
-    #[test]
-    fn tokens_small() {
-        assert_eq!(format_tokens(42), "42");
-    }
-
-    #[test]
-    fn tokens_thousands() {
-        assert_eq!(format_tokens(5_432), "5K");
-    }
-
-    #[test]
-    fn tokens_exact_thousand() {
-        assert_eq!(format_tokens(1_000), "1K");
-    }
-
-    #[test]
-    fn tokens_millions() {
-        assert_eq!(format_tokens(2_500_000), "2.5M");
-    }
-
-    #[test]
-    fn tokens_exact_million() {
-        assert_eq!(format_tokens(1_000_000), "1.0M");
-    }
-
-    #[test]
-    fn tokens_zero() {
-        assert_eq!(format_tokens(0), "0");
-    }
-
-    #[test]
-    fn tokens_large_millions() {
-        assert_eq!(format_tokens(15_700_000), "15.7M");
-    }
-
-    // =========================================================================
-    // get_worktree_name tests
-    // =========================================================================
-
-    #[test]
-    fn worktree_name_linked() {
-        let git_dir = "/home/user/project/.git/worktrees/feature-branch";
-        let result = get_worktree_name(git_dir);
-        assert_eq!(result, Some("feature-branch".to_string()));
-    }
-
-    #[test]
-    fn worktree_name_linked_trailing_slash() {
-        let git_dir = "/home/user/project/.git/worktrees/feature-branch/";
-        let result = get_worktree_name(git_dir);
-        assert_eq!(result, Some("feature-branch".to_string()));
-    }
-
-    #[test]
-    fn worktree_name_main_repo() {
-        // Main repo has git_dir like /path/.git, not a worktree
-        let git_dir = "/home/user/project/.git";
-        let result = get_worktree_name(git_dir);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn worktree_name_empty_name() {
-        // Edge case: empty worktree name (shouldn't happen in practice)
-        let git_dir = "/home/user/project/.git/worktrees/";
-        let result = get_worktree_name(git_dir);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn worktree_name_nested_path() {
-        // Worktree name with nested structure (rare but possible)
-        let git_dir = "/repo/.git/worktrees/release-v1";
-        let result = get_worktree_name(git_dir);
-        assert_eq!(result, Some("release-v1".to_string()));
-    }
-
-    // =========================================================================
-    // StatusView rendering tests — the seam: render with no I/O
-    // =========================================================================
-
-    fn empty_view() -> StatusView {
-        StatusView {
-            hostname: None,
-            project_name: String::new(),
-            display_cwd: String::new(),
-            branch: None,
-            worktree: None,
-            files_changed: 0,
-            ahead: 0,
-            behind: 0,
-            pr: None,
-            model: None,
-            context_pct: None,
-            output_style: None,
-            duration_ms: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-        }
-    }
-
-    #[test]
-    fn render_model_skips_unknown() {
-        let mut v = empty_view();
-        v.model = Some("Unknown".to_string());
-        assert_eq!(render_component("model", &v), None);
-
-        v.model = Some("Opus".to_string());
-        assert_eq!(
-            render_component("model", &v),
-            Some(format!("{TN_ORANGE}Opus{RESET}"))
-        );
-    }
-
-    #[test]
-    fn render_no_git_tracks_branch() {
-        let v = empty_view();
-        assert_eq!(
-            render_component("no_git", &v),
-            Some(format!("{TN_GRAY}no git{RESET}"))
-        );
-
-        let mut v2 = empty_view();
-        v2.branch = Some("main".to_string());
-        assert_eq!(render_component("no_git", &v2), None);
-        assert_eq!(
-            render_component("branch", &v2),
-            Some(format!("{TN_PURPLE}main{RESET}"))
-        );
-    }
-
-    #[test]
-    fn render_tokens_formats_both() {
-        let mut v = empty_view();
-        assert_eq!(render_component("tokens", &v), None);
-
-        v.input_tokens = 5_000;
-        v.output_tokens = 1_500_000;
-        assert_eq!(
-            render_component("tokens", &v),
-            Some(format!("{TN_GRAY}5K/1.5M{RESET}"))
-        );
-    }
-
-    #[test]
-    fn render_context_hides_at_full() {
-        let mut v = empty_view();
-        v.context_pct = Some(100.0);
-        assert_eq!(render_component("context", &v), None);
-
-        v.context_pct = Some(42.0);
-        assert_eq!(
-            render_component("context", &v),
-            Some(format!("{TN_TEAL}42%{RESET}"))
-        );
-    }
-
-    // =========================================================================
-    // PR cache codec + parse tests — gnarly logic that used to need a subprocess
-    // =========================================================================
-
-    #[test]
-    fn pr_cache_round_trips() {
-        let body = encode_pr_cache(1234567890, "feature/x", "{\"number\":7}");
-        let d = decode_pr_cache(&body).expect("decodes");
-        assert_eq!(d.timestamp, 1234567890);
-        assert_eq!(d.branch, "feature/x");
-        assert_eq!(d.payload, "{\"number\":7}");
-    }
-
-    #[test]
-    fn pr_cache_decode_preserves_multiline_payload() {
-        // Payload (pretty JSON) may contain newlines; decode must keep them all.
-        let body = encode_pr_cache(1, "main", "{\n  \"a\": 1\n}");
-        let d = decode_pr_cache(&body).expect("decodes");
-        assert_eq!(d.payload, "{\n  \"a\": 1\n}");
-    }
-
-    #[test]
-    fn pr_cache_decode_rejects_garbage() {
-        assert!(decode_pr_cache("").is_none());
-        assert!(decode_pr_cache("not-a-number\nmain\n{}").is_none());
-        assert!(decode_pr_cache("123").is_none()); // missing branch line
-    }
-
-    #[test]
-    fn check_status_empty_and_none() {
-        assert_eq!(compute_check_status(None), "");
-        assert_eq!(compute_check_status(Some(&[])), "");
-    }
-
-    fn run(conclusion: Option<&str>) -> GhCheckRun {
-        GhCheckRun {
-            conclusion: conclusion.map(String::from),
-        }
-    }
-
-    #[test]
-    fn check_status_case_insensitive_pass() {
-        // gh CLI uppercase + REST API lowercase both count as passing.
-        let runs = [
-            run(Some("SUCCESS")),
-            run(Some("skipped")),
-            run(Some("NEUTRAL")),
-        ];
-        assert_eq!(compute_check_status(Some(&runs)), "passed");
-    }
-
-    #[test]
-    fn check_status_any_failure_wins() {
-        let runs = [run(Some("success")), run(Some("FAILURE")), run(None)];
-        assert_eq!(compute_check_status(Some(&runs)), "failed");
-    }
-
-    #[test]
-    fn check_status_pending_when_unfinished() {
-        // A missing conclusion with no failures means still running.
-        let runs = [run(Some("SUCCESS")), run(None)];
-        assert_eq!(compute_check_status(Some(&runs)), "pending");
-    }
-
-    #[test]
-    fn parse_pr_payload_native_format() {
-        let json = r#"{"number":42,"state":"open","url":"https://x/42","commentsCount":3,"changedFiles":5,"statusCheckRollup":[{"conclusion":"SUCCESS"}]}"#;
-        let pr = parse_pr_payload(json).expect("parses");
-        assert_eq!(pr.number, 42);
-        assert_eq!(pr.state, "open");
-        assert_eq!(pr.comments, 3);
-        assert_eq!(pr.changed_files, 5);
-        assert_eq!(pr.check_status, "passed");
-    }
-
-    #[test]
-    fn parse_pr_payload_counts_comments_array() {
-        // gh CLI format: comments is an array, no commentsCount field.
-        let json = r#"{"number":1,"state":"open","url":"u","comments":[{},{}]}"#;
-        let pr = parse_pr_payload(json).expect("parses");
-        assert_eq!(pr.comments, 2);
-    }
-
-    #[test]
-    fn parse_pr_payload_rejects_incomplete() {
-        assert!(parse_pr_payload("{}").is_none()); // no number
-        assert!(parse_pr_payload(r#"{"number":0,"state":"open","url":"u"}"#).is_none());
-        assert!(parse_pr_payload(r#"{"number":1,"state":"","url":"u"}"#).is_none());
-        assert!(parse_pr_payload(r#"{"number":1,"state":"open","url":""}"#).is_none());
-        assert!(parse_pr_payload("not json").is_none());
-    }
-
-    #[test]
-    fn write_rows_skips_empty_rows() {
-        let config = Config {
-            rows: vec![vec!["model".to_string()], vec!["branch".to_string()]],
-        };
-        let mut v = empty_view();
-        v.model = Some("Opus".to_string());
-
-        let mut buf = Vec::new();
-        write_rows(&mut buf, &config, &v);
-        let out = String::from_utf8(buf).unwrap();
-
-        // model row renders; branch row is empty and is skipped entirely
-        assert_eq!(out.lines().count(), 1);
-        assert!(out.contains("Opus"));
+        assert_eq!(percent_encode(""), "");
     }
 }
