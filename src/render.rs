@@ -48,6 +48,9 @@ fn format_tokens(n: u64) -> String {
 /// or a genuine sub-path collapses. Both `/` and `\` count as boundaries so
 /// Windows `%USERPROFILE%` paths (e.g. `C:\Users\me\proj`) still shorten.
 fn collapse_home(current_dir: &str, home: &str) -> String {
+    // Normalize a trailing separator on HOME (e.g. "/home/me/") so exact-match
+    // and sub-path collapsing still work.
+    let home = home.trim_end_matches(['/', '\\']);
     if home.is_empty() {
         return current_dir.to_string();
     }
@@ -495,6 +498,17 @@ mod tests {
     #[test]
     fn collapse_home_unrelated_path() {
         assert_eq!(collapse_home("/var/log", "/home/al"), "/var/log");
+    }
+
+    #[test]
+    fn collapse_home_trailing_separator() {
+        // HOME with a trailing separator must still match.
+        assert_eq!(collapse_home("/home/me", "/home/me/"), "~");
+        assert_eq!(collapse_home("/home/me/src", "/home/me/"), "~/src");
+        assert_eq!(
+            collapse_home("C:\\Users\\me\\proj", "C:\\Users\\me\\"),
+            "~\\proj"
+        );
     }
 
     #[test]
