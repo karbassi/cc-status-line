@@ -547,120 +547,98 @@ fn get_pr_attempt_path(repo_path: &str, branch: &str) -> PathBuf {
     get_cache_dir().join(format!("pr-attempt-{:016x}", hash_path(&key)))
 }
 
-/// Load PR cache - reads file once and handles all states
-fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
-    let cache_path = get_pr_cache_path(repo_path, branch);
-    let Ok(content) = fs::read_to_string(&cache_path) else {
-        return PrCacheResult::Stale;
-    };
+// ----------------------------------------------------------------------------
+// PR cache codec — the single home for the on-disk format.
+//
+// Format: `timestamp\nbranch\npayload`, where payload is a JSON blob, the
+// `NO_PR` negative-cache marker, or an `ERROR:...` marker. Every Rust writer
+// goes through `encode_pr_cache`; the one exception is the detached gh refresh
+// shell script (`spawn_pr_refresh_gh`), which builds the same layout via printf
+// because it runs in a separate process.
+// ponytail: keep this format dead simple (line-delimited); switch to a struct +
+// serde only if a field ever needs escaping.
+// ----------------------------------------------------------------------------
 
-    // Cache file format:
-    //   1st line: UNIX timestamp (seconds since epoch)
-    //   2nd line: cached branch name
-    //   remaining lines: JSON payload, "NO_PR" marker, or "ERROR:..." marker
+fn encode_pr_cache(timestamp: u64, branch: &str, payload: &str) -> String {
+    format!("{timestamp}\n{branch}\n{payload}")
+}
+
+struct DecodedPrCache {
+    timestamp: u64,
+    branch: String,
+    payload: String,
+}
+
+fn decode_pr_cache(content: &str) -> Option<DecodedPrCache> {
     let mut lines = content.lines();
-    let timestamp: u64 = match lines.next().and_then(|s| s.parse().ok()) {
-        Some(t) => t,
-        None => return PrCacheResult::Stale,
-    };
-    let Some(cached_branch) = lines.next() else {
-        return PrCacheResult::Stale;
-    };
+    let timestamp = lines.next()?.parse().ok()?;
+    let branch = lines.next()?.to_string();
+    let payload = lines.collect::<Vec<_>>().join("\n");
+    Some(DecodedPrCache {
+        timestamp,
+        branch,
+        payload,
+    })
+}
 
-    // Validate branch matches
-    if cached_branch != branch {
-        let _ = fs::remove_file(&cache_path);
-        return PrCacheResult::Stale;
-    }
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age = now.saturating_sub(timestamp);
-
-    // Rest is JSON - check for special markers first
-    let json_str: String = lines.collect::<Vec<_>>().join("\n");
-
-    // Handle NO_PR marker (negative cache with longer TTL)
-    if json_str == "NO_PR" {
-        if age < PR_NEGATIVE_CACHE_TTL {
-            return PrCacheResult::NoPr;
-        }
-        return PrCacheResult::Stale;
-    }
-
-    // Handle ERROR marker - don't cache errors, always retry
-    if json_str.starts_with("ERROR:") {
-        return PrCacheResult::Stale;
-    }
-
-    // Check normal TTL
-    if age > PR_CACHE_TTL {
-        return PrCacheResult::Stale;
-    }
-
-    // Parse JSON
-    let pr: GhPrJson = match serde_json::from_str(&json_str) {
-        Ok(p) => p,
-        Err(_) => return PrCacheResult::Stale,
+/// Reduce a check-run rollup to "passed" / "failed" / "pending" / "".
+///
+/// gh CLI returns uppercase conclusions (`SUCCESS`), the REST API lowercase
+/// (`success`); matched case-insensitively. Any non-passing conclusion is a
+/// failure; a missing conclusion is pending.
+fn compute_check_status(rollup: Option<&[GhCheckRun]>) -> String {
+    let checks = match rollup {
+        Some(c) if !c.is_empty() => c,
+        _ => return String::new(),
     };
 
-    // Compute check status from rollup
-    // Note: gh CLI returns uppercase (SUCCESS), REST API returns lowercase (success)
-    let check_status = match &pr.status_check_rollup {
-        None => String::new(),
-        Some(checks) if checks.is_empty() => String::new(),
-        Some(checks) => {
-            // Case-insensitive check for passing conclusions
-            let is_passing = |s: &str| {
-                matches!(
-                    s.to_ascii_uppercase().as_str(),
-                    "SUCCESS" | "SKIPPED" | "NEUTRAL"
-                )
-            };
-
-            // Treat any non-success conclusion as a failure
-            let has_failure = checks.iter().any(|c| {
-                match c.conclusion.as_deref() {
-                    Some(conc) if is_passing(conc) => false,
-                    Some(_) => true, // FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, etc.
-                    None => false,
-                }
-            });
-            let has_pending = checks.iter().any(|c| c.conclusion.is_none());
-            let all_passed = checks.iter().all(|c| match c.conclusion.as_deref() {
-                Some(conc) => is_passing(conc),
-                None => false,
-            });
-
-            if has_failure {
-                "failed".to_string()
-            } else if all_passed {
-                "passed".to_string()
-            } else if has_pending {
-                "pending".to_string()
-            } else {
-                String::new()
-            }
-        }
+    let is_passing = |s: &str| {
+        matches!(
+            s.to_ascii_uppercase().as_str(),
+            "SUCCESS" | "SKIPPED" | "NEUTRAL"
+        )
     };
 
-    // Validate required fields - treat missing/invalid data as stale
+    let has_failure = checks.iter().any(|c| match c.conclusion.as_deref() {
+        Some(conc) if is_passing(conc) => false,
+        Some(_) => true, // FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, etc.
+        None => false,
+    });
+    let has_pending = checks.iter().any(|c| c.conclusion.is_none());
+    let all_passed = checks.iter().all(|c| match c.conclusion.as_deref() {
+        Some(conc) => is_passing(conc),
+        None => false,
+    });
+
+    if has_failure {
+        "failed".to_string()
+    } else if all_passed {
+        "passed".to_string()
+    } else if has_pending {
+        "pending".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Parse a PR JSON payload (gh CLI or native format) into validated PR data.
+/// Returns None when required fields are missing or invalid (caller: treat as stale).
+fn parse_pr_payload(json_str: &str) -> Option<PrCacheData> {
+    let pr: GhPrJson = serde_json::from_str(json_str).ok()?;
+    let check_status = compute_check_status(pr.status_check_rollup.as_deref());
+
     #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
     let number = match pr.number {
         Some(n) if n > 0 => n as u32,
-        _ => return PrCacheResult::Stale,
+        _ => return None,
     };
-
     let state = match pr.state {
         Some(s) if !s.is_empty() => s,
-        _ => return PrCacheResult::Stale,
+        _ => return None,
     };
-
     let url = match pr.url {
         Some(u) if !u.is_empty() => u,
-        _ => return PrCacheResult::Stale,
+        _ => return None,
     };
 
     // Prefer commentsCount (numeric) over comments array to avoid large allocations
@@ -672,7 +650,7 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         .unwrap_or(0);
 
     #[allow(clippy::cast_possible_truncation)] // PR numbers/counts won't exceed u32::MAX
-    PrCacheResult::Hit(PrCacheData {
+    Some(PrCacheData {
         number,
         state,
         url,
@@ -680,6 +658,53 @@ fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
         changed_files: pr.changed_files.unwrap_or(0) as u32,
         check_status,
     })
+}
+
+/// Load PR cache - reads file once and handles all states
+fn load_pr_cache(repo_path: &str, branch: &str) -> PrCacheResult {
+    let cache_path = get_pr_cache_path(repo_path, branch);
+    let Ok(content) = fs::read_to_string(&cache_path) else {
+        return PrCacheResult::Stale;
+    };
+    let Some(decoded) = decode_pr_cache(&content) else {
+        return PrCacheResult::Stale;
+    };
+
+    // Validate branch matches
+    if decoded.branch != branch {
+        let _ = fs::remove_file(&cache_path);
+        return PrCacheResult::Stale;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(decoded.timestamp);
+    let payload = decoded.payload;
+
+    // NO_PR marker - negative cache with longer TTL
+    if payload == "NO_PR" {
+        if age < PR_NEGATIVE_CACHE_TTL {
+            return PrCacheResult::NoPr;
+        }
+        return PrCacheResult::Stale;
+    }
+
+    // ERROR marker - don't cache errors, always retry
+    if payload.starts_with("ERROR:") {
+        return PrCacheResult::Stale;
+    }
+
+    // Normal TTL
+    if age > PR_CACHE_TTL {
+        return PrCacheResult::Stale;
+    }
+
+    match parse_pr_payload(&payload) {
+        Some(data) => PrCacheResult::Hit(data),
+        None => PrCacheResult::Stale,
+    }
 }
 
 // ============================================================================
@@ -768,6 +793,8 @@ fn spawn_pr_refresh_gh(git_dir: &str, work_dir: &str, branch: &str) {
     // 4. If gh fails for other reasons -> write ERROR (don't negative cache)
     // 5. Atomic rename temp file to cache file
     // Uses trap with $0 for cleanup to avoid quoting issues with shell_escape
+    // ponytail: this printf must mirror encode_pr_cache's `timestamp\nbranch\npayload`
+    // layout by hand — it runs in a detached process and can't call back into Rust.
     let script = format!(
         r#"#!/bin/sh
 trap 'rm -f "$0"' EXIT
@@ -880,7 +907,7 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
 
             if prs.is_empty() {
                 // No PR for this branch - negative cache
-                format!("{now}\n{branch}\nNO_PR")
+                encode_pr_cache(now, branch, "NO_PR")
             } else {
                 // Found PR - convert to gh-compatible format
                 let pr = &prs[0];
@@ -957,17 +984,17 @@ fn fetch_pr_data_native(git_dir: &str, branch: &str, owner: &str, repo: &str, to
                     "statusCheckRollup": check_rollup
                 });
 
-                format!("{now}\n{branch}\n{gh_json}")
+                encode_pr_cache(now, branch, &gh_json.to_string())
             }
         }
         Err(ureq::Error::Status(code, _)) => {
             // API error (401/403/404 etc) - don't negative cache
             // Note: 404 can mean "no access" for private repos, not just "no PR"
-            format!("{now}\n{branch}\nERROR:HTTP {code}")
+            encode_pr_cache(now, branch, &format!("ERROR:HTTP {code}"))
         }
         Err(e) => {
             // Network error - don't negative cache
-            format!("{now}\n{branch}\nERROR:{e}")
+            encode_pr_cache(now, branch, &format!("ERROR:{e}"))
         }
     };
 
@@ -2311,6 +2338,98 @@ mod tests {
             render_component("context", &v),
             Some(format!("{TN_TEAL}42%{RESET}"))
         );
+    }
+
+    // =========================================================================
+    // PR cache codec + parse tests — gnarly logic that used to need a subprocess
+    // =========================================================================
+
+    #[test]
+    fn pr_cache_round_trips() {
+        let body = encode_pr_cache(1234567890, "feature/x", "{\"number\":7}");
+        let d = decode_pr_cache(&body).expect("decodes");
+        assert_eq!(d.timestamp, 1234567890);
+        assert_eq!(d.branch, "feature/x");
+        assert_eq!(d.payload, "{\"number\":7}");
+    }
+
+    #[test]
+    fn pr_cache_decode_preserves_multiline_payload() {
+        // Payload (pretty JSON) may contain newlines; decode must keep them all.
+        let body = encode_pr_cache(1, "main", "{\n  \"a\": 1\n}");
+        let d = decode_pr_cache(&body).expect("decodes");
+        assert_eq!(d.payload, "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn pr_cache_decode_rejects_garbage() {
+        assert!(decode_pr_cache("").is_none());
+        assert!(decode_pr_cache("not-a-number\nmain\n{}").is_none());
+        assert!(decode_pr_cache("123").is_none()); // missing branch line
+    }
+
+    #[test]
+    fn check_status_empty_and_none() {
+        assert_eq!(compute_check_status(None), "");
+        assert_eq!(compute_check_status(Some(&[])), "");
+    }
+
+    fn run(conclusion: Option<&str>) -> GhCheckRun {
+        GhCheckRun {
+            conclusion: conclusion.map(String::from),
+        }
+    }
+
+    #[test]
+    fn check_status_case_insensitive_pass() {
+        // gh CLI uppercase + REST API lowercase both count as passing.
+        let runs = [
+            run(Some("SUCCESS")),
+            run(Some("skipped")),
+            run(Some("NEUTRAL")),
+        ];
+        assert_eq!(compute_check_status(Some(&runs)), "passed");
+    }
+
+    #[test]
+    fn check_status_any_failure_wins() {
+        let runs = [run(Some("success")), run(Some("FAILURE")), run(None)];
+        assert_eq!(compute_check_status(Some(&runs)), "failed");
+    }
+
+    #[test]
+    fn check_status_pending_when_unfinished() {
+        // A missing conclusion with no failures means still running.
+        let runs = [run(Some("SUCCESS")), run(None)];
+        assert_eq!(compute_check_status(Some(&runs)), "pending");
+    }
+
+    #[test]
+    fn parse_pr_payload_native_format() {
+        let json = r#"{"number":42,"state":"open","url":"https://x/42","commentsCount":3,"changedFiles":5,"statusCheckRollup":[{"conclusion":"SUCCESS"}]}"#;
+        let pr = parse_pr_payload(json).expect("parses");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.state, "open");
+        assert_eq!(pr.comments, 3);
+        assert_eq!(pr.changed_files, 5);
+        assert_eq!(pr.check_status, "passed");
+    }
+
+    #[test]
+    fn parse_pr_payload_counts_comments_array() {
+        // gh CLI format: comments is an array, no commentsCount field.
+        let json = r#"{"number":1,"state":"open","url":"u","comments":[{},{}]}"#;
+        let pr = parse_pr_payload(json).expect("parses");
+        assert_eq!(pr.comments, 2);
+    }
+
+    #[test]
+    fn parse_pr_payload_rejects_incomplete() {
+        assert!(parse_pr_payload("{}").is_none()); // no number
+        assert!(parse_pr_payload(r#"{"number":0,"state":"open","url":"u"}"#).is_none());
+        assert!(parse_pr_payload(r#"{"number":1,"state":"","url":"u"}"#).is_none());
+        assert!(parse_pr_payload(r#"{"number":1,"state":"open","url":""}"#).is_none());
+        assert!(parse_pr_payload("not json").is_none());
     }
 
     #[test]
