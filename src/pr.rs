@@ -73,7 +73,7 @@ fn get_pr_attempt_path(repo_path: &str, branch: &str) -> PathBuf {
 // goes through `encode_pr_cache`; the one exception is the detached gh refresh
 // shell script (`spawn_pr_refresh_gh`), which builds the same layout via printf
 // because it runs in a separate process.
-// ponytail: keep this format dead simple (line-delimited); switch to a struct +
+// NOTE: keep this format dead simple (line-delimited); switch to a struct +
 // serde only if a field ever needs escaping.
 // ----------------------------------------------------------------------------
 
@@ -293,7 +293,7 @@ fn spawn_pr_refresh_gh(git_dir: &str, work_dir: &str, branch: &str) {
     // 4. If gh fails for other reasons -> write ERROR (don't negative cache)
     // 5. Atomic rename temp file to cache file
     // Uses trap with $0 for cleanup to avoid quoting issues with shell_escape
-    // ponytail: this printf must mirror encode_pr_cache's `timestamp\nbranch\npayload`
+    // NOTE: this printf must mirror encode_pr_cache's `timestamp\nbranch\npayload`
     // layout by hand — it runs in a detached process and can't call back into Rust.
     let script = format!(
         r#"#!/bin/sh
