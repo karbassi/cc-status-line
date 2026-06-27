@@ -111,10 +111,9 @@ fn compute_check_status(rollup: Option<&[GhCheckRun]>) -> String {
     };
 
     let is_passing = |s: &str| {
-        matches!(
-            s.to_ascii_uppercase().as_str(),
-            "SUCCESS" | "SKIPPED" | "NEUTRAL"
-        )
+        s.eq_ignore_ascii_case("SUCCESS")
+            || s.eq_ignore_ascii_case("SKIPPED")
+            || s.eq_ignore_ascii_case("NEUTRAL")
     };
 
     let has_failure = checks.iter().any(|c| match c.conclusion.as_deref() {
