@@ -1285,11 +1285,11 @@ fn main() {
 
     // Load config and render
     let config = load_config();
-    let ctx = RenderContext::new(&data, &current_dir, git_repo.as_ref());
+    let view = gather(&data, &current_dir, git_repo.as_ref());
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    write_rows(&mut out, config, &ctx);
+    write_rows(&mut out, config, &view);
     out.flush().unwrap_or_default();
 }
 
@@ -1483,125 +1483,140 @@ fn format_tokens(n: u64) -> String {
 // Config-driven rendering
 // ============================================================================
 
-/// Context for rendering components - holds all data needed by any component
-struct RenderContext<'a> {
-    data: &'a ClaudeInput,
-    git: Option<&'a GitRepo>,
-    // Cached computed values
+/// Plain, fully-resolved data the status line renders from.
+///
+/// This is the seam: `gather` does all I/O (git, PR fetch, hostname) and produces
+/// a `StatusView`; `render_component` consumes one and touches nothing else. Tests
+/// build a `StatusView` literal and assert exact output — no process spawn, no git,
+/// no network.
+struct StatusView {
+    hostname: Option<String>,
     project_name: String,
     display_cwd: String,
-    hostname: Option<&'static String>,
-    // Git stats (computed lazily via Option)
-    git_stats: Option<(u32, u32, u32)>, // (files_changed, ahead, behind)
-    // PR data (computed lazily)
-    pr_data: Option<PrCacheData>,
+    branch: Option<String>,
+    worktree: Option<String>,
+    files_changed: u32,
+    ahead: u32,
+    behind: u32,
+    pr: Option<PrCacheData>,
+    model: Option<String>,
+    context_pct: Option<f64>,
+    output_style: Option<String>,
+    duration_ms: u64,
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
-impl<'a> RenderContext<'a> {
-    fn new(data: &'a ClaudeInput, current_dir: &'a str, git: Option<&'a GitRepo>) -> Self {
-        let project_name = data
-            .workspace
-            .project_dir
-            .as_ref()
-            .and_then(|p| Path::new(p).file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+/// Resolve a `StatusView` from input and the discovered repo, running all I/O here.
+fn gather(data: &ClaudeInput, current_dir: &str, git: Option<&GitRepo>) -> StatusView {
+    let project_name = data
+        .workspace
+        .project_dir
+        .as_ref()
+        .and_then(|p| Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
-        let home = get_home();
-        let display_cwd = if !home.is_empty() && current_dir.starts_with(home) {
-            format!("~{}", &current_dir[home.len()..])
-        } else {
-            current_dir.to_string()
-        };
+    let home = get_home();
+    let display_cwd = if !home.is_empty() && current_dir.starts_with(home) {
+        format!("~{}", &current_dir[home.len()..])
+    } else {
+        current_dir.to_string()
+    };
 
-        let hostname = if is_ssh_session() {
-            get_hostname()
-        } else {
-            None
-        };
+    let hostname = if is_ssh_session() {
+        get_hostname().cloned()
+    } else {
+        None
+    };
 
-        // Compute git stats upfront if we have a git repo and no JSON override
-        let git_stats = if data.git.branch.is_some() {
-            // Using JSON input
-            Some((
-                data.git.changed_files.unwrap_or(0),
-                data.git.ahead.unwrap_or(0),
-                data.git.behind.unwrap_or(0),
-            ))
-        } else if let Some(g) = git {
-            let cache = load_mmap_cache(&g.git_dir);
-            let current_mtime = g.index_mtime();
-            let current_oid = g.head_oid();
+    // Compute git stats upfront if we have a git repo and no JSON override
+    let (files_changed, ahead, behind) = if data.git.branch.is_some() {
+        // Using JSON input
+        (
+            data.git.changed_files.unwrap_or(0),
+            data.git.ahead.unwrap_or(0),
+            data.git.behind.unwrap_or(0),
+        )
+    } else if let Some(g) = git {
+        let cache = load_mmap_cache(&g.git_dir);
+        let current_mtime = g.index_mtime();
+        let current_oid = g.head_oid();
 
-            let (files, _, _) = if let Some(ref c) = cache {
-                if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
-                    (c.files_changed, c.lines_added, c.lines_deleted)
-                } else {
-                    compute_and_cache_git_stats(g, current_mtime, &current_oid)
-                }
+        let (files, _, _) = if let Some(ref c) = cache {
+            if c.index_mtime == current_mtime && c.head_oid_matches(&current_oid) {
+                (c.files_changed, c.lines_added, c.lines_deleted)
             } else {
                 compute_and_cache_git_stats(g, current_mtime, &current_oid)
-            };
-
-            let (ahead, behind) = get_ahead_behind(&g.repo, &g.branch);
-            Some((files, ahead, behind))
+            }
         } else {
-            None
+            compute_and_cache_git_stats(g, current_mtime, &current_oid)
         };
 
-        // Get PR data
-        let pr_data = if data.pr.number.is_some() {
-            // Using JSON input
-            Some(PrCacheData {
-                number: data.pr.number.unwrap_or(0),
-                state: data.pr.state.clone().unwrap_or_default(),
-                url: data.pr.url.clone().unwrap_or_default(),
-                comments: data.pr.comments.unwrap_or(0),
-                changed_files: data.pr.changed_files.unwrap_or(0),
-                check_status: data.pr.check_status.clone().unwrap_or_default(),
-            })
-        } else {
-            git.and_then(get_pr_data)
-        };
+        let (ahead, behind) = get_ahead_behind(&g.repo, &g.branch);
+        (files, ahead, behind)
+    } else {
+        (0, 0, 0)
+    };
 
-        Self {
-            data,
-            git,
-            project_name,
-            display_cwd,
-            hostname,
-            git_stats,
-            pr_data,
-        }
-    }
+    // Get PR data
+    let pr = if data.pr.number.is_some() {
+        // Using JSON input
+        Some(PrCacheData {
+            number: data.pr.number.unwrap_or(0),
+            state: data.pr.state.clone().unwrap_or_default(),
+            url: data.pr.url.clone().unwrap_or_default(),
+            comments: data.pr.comments.unwrap_or(0),
+            changed_files: data.pr.changed_files.unwrap_or(0),
+            check_status: data.pr.check_status.clone().unwrap_or_default(),
+        })
+    } else {
+        git.and_then(get_pr_data)
+    };
 
-    fn branch(&self) -> Option<&str> {
-        self.data
-            .git
-            .branch
-            .as_deref()
-            .or_else(|| self.git.map(|g| g.branch.as_str()))
-    }
+    let branch = data
+        .git
+        .branch
+        .clone()
+        .or_else(|| git.map(|g| g.branch.clone()));
+    let worktree = data
+        .git
+        .worktree
+        .clone()
+        .or_else(|| git.and_then(|g| g.worktree.clone()));
 
-    fn worktree(&self) -> Option<&str> {
-        self.data
-            .git
-            .worktree
-            .as_deref()
-            .or_else(|| self.git.and_then(|g| g.worktree.as_deref()))
+    StatusView {
+        hostname,
+        project_name,
+        display_cwd,
+        branch,
+        worktree,
+        files_changed,
+        ahead,
+        behind,
+        pr,
+        model: data.model.display_name.clone(),
+        context_pct: data.context_window.remaining_percentage,
+        output_style: data.output_style.name.clone(),
+        duration_ms: data.cost.total_duration_ms.unwrap_or(0),
+        input_tokens: data.context_window.total_input_tokens.unwrap_or(0),
+        output_tokens: data.context_window.total_output_tokens.unwrap_or(0),
     }
 }
 
 /// Render a single component, returning colored output string or None if no data
-fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
+fn render_component(name: &str, view: &StatusView) -> Option<String> {
     match name {
-        "hostname" => ctx.hostname.map(|h| format!("{TN_GREEN}{h}{RESET}")),
+        "hostname" => view
+            .hostname
+            .as_ref()
+            .map(|h| format!("{TN_GREEN}{h}{RESET}")),
 
         "project" => {
-            if ctx.project_name.is_empty() {
+            if view.project_name.is_empty() {
                 None
             } else {
-                Some(format!("{TN_BLUE}{}{RESET}", ctx.project_name))
+                Some(format!("{TN_BLUE}{}{RESET}", view.project_name))
             }
         }
 
@@ -1610,25 +1625,31 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
             // Since config allows placing path on any row, we can't know what other
             // components share the row. Use ~60% of terminal width as a reasonable default.
             let path_width = (TERM_WIDTH * 3 / 5).max(20);
-            let abbrev = abbreviate_path(&ctx.display_cwd, path_width);
+            let abbrev = abbreviate_path(&view.display_cwd, path_width);
             Some(format!("{TN_CYAN}{abbrev}{RESET}"))
         }
 
-        "branch" => ctx.branch().map(|b| format!("{TN_PURPLE}{b}{RESET}")),
+        "branch" => view
+            .branch
+            .as_deref()
+            .map(|b| format!("{TN_PURPLE}{b}{RESET}")),
 
         // Shows "no git" when there's no branch (not in a git repo)
         "no_git" => {
-            if ctx.branch().is_none() {
+            if view.branch.is_none() {
                 Some(format!("{TN_GRAY}no git{RESET}"))
             } else {
                 None
             }
         }
 
-        "worktree" => ctx.worktree().map(|wt| format!("{TN_MAGENTA}{wt}{RESET}")),
+        "worktree" => view
+            .worktree
+            .as_deref()
+            .map(|wt| format!("{TN_MAGENTA}{wt}{RESET}")),
 
         "files" => {
-            let files = ctx.git_stats.map(|(f, _, _)| f).unwrap_or(0);
+            let files = view.files_changed;
             if files > 0 {
                 Some(format!("{TN_GRAY}{files} files{RESET}"))
             } else {
@@ -1637,7 +1658,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "ahead_behind" => {
-            let (ahead, behind) = ctx.git_stats.map(|(_, a, b)| (a, b)).unwrap_or((0, 0));
+            let (ahead, behind) = (view.ahead, view.behind);
             if ahead > 0 || behind > 0 {
                 let mut s = String::new();
                 if ahead > 0 {
@@ -1656,7 +1677,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "pr_number" => {
-            let pr = ctx.pr_data.as_ref()?;
+            let pr = view.pr.as_ref()?;
             if pr.url.is_empty() {
                 Some(format!("{TN_CYAN}#{}{RESET}", pr.number))
             } else {
@@ -1668,7 +1689,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "pr_state" => {
-            let pr = ctx.pr_data.as_ref()?;
+            let pr = view.pr.as_ref()?;
             let state_lower = pr.state.to_lowercase();
             let color = match state_lower.as_str() {
                 "open" => TN_GREEN,
@@ -1680,7 +1701,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "pr_comments" => {
-            let pr = ctx.pr_data.as_ref()?;
+            let pr = view.pr.as_ref()?;
             if pr.comments > 0 {
                 let label = if pr.comments == 1 {
                     "comment"
@@ -1694,7 +1715,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "pr_files" => {
-            let pr = ctx.pr_data.as_ref()?;
+            let pr = view.pr.as_ref()?;
             if pr.changed_files > 0 {
                 let label = if pr.changed_files == 1 {
                     "file"
@@ -1708,7 +1729,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "pr_checks" => {
-            let pr = ctx.pr_data.as_ref()?;
+            let pr = view.pr.as_ref()?;
             let checks_url = if pr.url.is_empty() {
                 String::new()
             } else {
@@ -1732,7 +1753,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "model" => {
-            if let Some(model) = &ctx.data.model.display_name
+            if let Some(model) = &view.model
                 && model != "Unknown"
             {
                 return Some(format!("{TN_ORANGE}{model}{RESET}"));
@@ -1742,11 +1763,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
 
         "context" => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pct = ctx
-                .data
-                .context_window
-                .remaining_percentage
-                .unwrap_or(100.0) as u32;
+            let pct = view.context_pct.unwrap_or(100.0) as u32;
             if pct < 100 {
                 Some(format!("{TN_TEAL}{pct}%{RESET}"))
             } else {
@@ -1755,7 +1772,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "style" => {
-            if let Some(mode) = &ctx.data.output_style.name
+            if let Some(mode) = &view.output_style
                 && mode != "default"
             {
                 return Some(format!("{TN_BLUE}{mode}{RESET}"));
@@ -1764,7 +1781,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "duration" => {
-            let ms = ctx.data.cost.total_duration_ms.unwrap_or(0);
+            let ms = view.duration_ms;
             if ms > 0 {
                 let total_secs = ms / 1000;
                 let mins = total_secs / 60;
@@ -1781,8 +1798,8 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
         }
 
         "tokens" => {
-            let input = ctx.data.context_window.total_input_tokens.unwrap_or(0);
-            let output = ctx.data.context_window.total_output_tokens.unwrap_or(0);
+            let input = view.input_tokens;
+            let output = view.output_tokens;
             if input > 0 || output > 0 {
                 Some(format!(
                     "{TN_GRAY}{}/{}{RESET}",
@@ -1799,7 +1816,7 @@ fn render_component(name: &str, ctx: &RenderContext) -> Option<String> {
 }
 
 /// Write all rows according to config
-fn write_rows<W: Write>(out: &mut W, config: &Config, ctx: &RenderContext) {
+fn write_rows<W: Write>(out: &mut W, config: &Config, view: &StatusView) {
     for row_components in &config.rows {
         if row_components.is_empty() {
             continue;
@@ -1807,7 +1824,7 @@ fn write_rows<W: Write>(out: &mut W, config: &Config, ctx: &RenderContext) {
 
         let parts: Vec<String> = row_components
             .iter()
-            .filter_map(|name| render_component(name, ctx))
+            .filter_map(|name| render_component(name, view))
             .collect();
 
         if !parts.is_empty() {
@@ -2214,5 +2231,102 @@ mod tests {
         let git_dir = "/repo/.git/worktrees/release-v1";
         let result = get_worktree_name(git_dir);
         assert_eq!(result, Some("release-v1".to_string()));
+    }
+
+    // =========================================================================
+    // StatusView rendering tests — the seam: render with no I/O
+    // =========================================================================
+
+    fn empty_view() -> StatusView {
+        StatusView {
+            hostname: None,
+            project_name: String::new(),
+            display_cwd: String::new(),
+            branch: None,
+            worktree: None,
+            files_changed: 0,
+            ahead: 0,
+            behind: 0,
+            pr: None,
+            model: None,
+            context_pct: None,
+            output_style: None,
+            duration_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn render_model_skips_unknown() {
+        let mut v = empty_view();
+        v.model = Some("Unknown".to_string());
+        assert_eq!(render_component("model", &v), None);
+
+        v.model = Some("Opus".to_string());
+        assert_eq!(
+            render_component("model", &v),
+            Some(format!("{TN_ORANGE}Opus{RESET}"))
+        );
+    }
+
+    #[test]
+    fn render_no_git_tracks_branch() {
+        let v = empty_view();
+        assert_eq!(
+            render_component("no_git", &v),
+            Some(format!("{TN_GRAY}no git{RESET}"))
+        );
+
+        let mut v2 = empty_view();
+        v2.branch = Some("main".to_string());
+        assert_eq!(render_component("no_git", &v2), None);
+        assert_eq!(
+            render_component("branch", &v2),
+            Some(format!("{TN_PURPLE}main{RESET}"))
+        );
+    }
+
+    #[test]
+    fn render_tokens_formats_both() {
+        let mut v = empty_view();
+        assert_eq!(render_component("tokens", &v), None);
+
+        v.input_tokens = 5_000;
+        v.output_tokens = 1_500_000;
+        assert_eq!(
+            render_component("tokens", &v),
+            Some(format!("{TN_GRAY}5K/1.5M{RESET}"))
+        );
+    }
+
+    #[test]
+    fn render_context_hides_at_full() {
+        let mut v = empty_view();
+        v.context_pct = Some(100.0);
+        assert_eq!(render_component("context", &v), None);
+
+        v.context_pct = Some(42.0);
+        assert_eq!(
+            render_component("context", &v),
+            Some(format!("{TN_TEAL}42%{RESET}"))
+        );
+    }
+
+    #[test]
+    fn write_rows_skips_empty_rows() {
+        let config = Config {
+            rows: vec![vec!["model".to_string()], vec!["branch".to_string()]],
+        };
+        let mut v = empty_view();
+        v.model = Some("Opus".to_string());
+
+        let mut buf = Vec::new();
+        write_rows(&mut buf, &config, &v);
+        let out = String::from_utf8(buf).unwrap();
+
+        // model row renders; branch row is empty and is skipped entirely
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("Opus"));
     }
 }
