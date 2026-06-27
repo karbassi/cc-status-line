@@ -45,7 +45,8 @@ fn format_tokens(n: u64) -> String {
 /// Collapse a leading `$HOME` to `~`, but only at a path-separator boundary.
 ///
 /// `HOME=/home/al` must not shorten `/home/alex` to `~ex` — only an exact match
-/// or a genuine sub-path (`/home/al/...`) collapses.
+/// or a genuine sub-path collapses. Both `/` and `\` count as boundaries so
+/// Windows `%USERPROFILE%` paths (e.g. `C:\Users\me\proj`) still shorten.
 fn collapse_home(current_dir: &str, home: &str) -> String {
     if home.is_empty() {
         return current_dir.to_string();
@@ -54,7 +55,7 @@ fn collapse_home(current_dir: &str, home: &str) -> String {
         return "~".to_string();
     }
     if let Some(rest) = current_dir.strip_prefix(home)
-        && rest.starts_with('/')
+        && (rest.starts_with('/') || rest.starts_with('\\'))
     {
         return format!("~{rest}");
     }
@@ -489,6 +490,19 @@ mod tests {
     #[test]
     fn collapse_home_unrelated_path() {
         assert_eq!(collapse_home("/var/log", "/home/al"), "/var/log");
+    }
+
+    #[test]
+    fn collapse_home_windows_backslash_boundary() {
+        assert_eq!(
+            collapse_home("C:\\Users\\me\\proj", "C:\\Users\\me"),
+            "~\\proj"
+        );
+        // Prefix-only must still be rejected with backslash paths.
+        assert_eq!(
+            collapse_home("C:\\Users\\meadow", "C:\\Users\\me"),
+            "C:\\Users\\meadow"
+        );
     }
 
     #[test]
