@@ -42,6 +42,25 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Collapse a leading `$HOME` to `~`, but only at a path-separator boundary.
+///
+/// `HOME=/home/al` must not shorten `/home/alex` to `~ex` — only an exact match
+/// or a genuine sub-path (`/home/al/...`) collapses.
+fn collapse_home(current_dir: &str, home: &str) -> String {
+    if home.is_empty() {
+        return current_dir.to_string();
+    }
+    if current_dir == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = current_dir.strip_prefix(home)
+        && rest.starts_with('/')
+    {
+        return format!("~{rest}");
+    }
+    current_dir.to_string()
+}
+
 /// Plain, fully-resolved data the status line renders from.
 ///
 /// This is the seam: `gather` does all I/O (git, PR fetch, hostname) and produces
@@ -76,12 +95,7 @@ pub(crate) fn gather(data: &ClaudeInput, current_dir: &str, git: Option<&GitRepo
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let home = get_home();
-    let display_cwd = if !home.is_empty() && current_dir.starts_with(home) {
-        format!("~{}", &current_dir[home.len()..])
-    } else {
-        current_dir.to_string()
-    };
+    let display_cwd = collapse_home(current_dir, get_home());
 
     let hostname = if is_ssh_session() {
         get_hostname().cloned()
@@ -449,6 +463,32 @@ mod tests {
     #[test]
     fn tokens_large_millions() {
         assert_eq!(format_tokens(15_700_000), "15.7M");
+    }
+
+    #[test]
+    fn collapse_home_exact_match() {
+        assert_eq!(collapse_home("/home/al", "/home/al"), "~");
+    }
+
+    #[test]
+    fn collapse_home_subpath() {
+        assert_eq!(collapse_home("/home/al/src", "/home/al"), "~/src");
+    }
+
+    #[test]
+    fn collapse_home_rejects_prefix_only() {
+        // The bug: /home/alex must not become ~ex under HOME=/home/al.
+        assert_eq!(collapse_home("/home/alex", "/home/al"), "/home/alex");
+    }
+
+    #[test]
+    fn collapse_home_empty_home_is_noop() {
+        assert_eq!(collapse_home("/home/al", ""), "/home/al");
+    }
+
+    #[test]
+    fn collapse_home_unrelated_path() {
+        assert_eq!(collapse_home("/var/log", "/home/al"), "/var/log");
     }
 
     #[test]
