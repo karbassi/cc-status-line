@@ -510,7 +510,7 @@ fn no_ssh_env_no_hostname() {
 
 /// Helper to run the binary with a custom config file
 fn run_with_config(work_dir: &PathBuf, json_input: &str, config_content: &str) -> String {
-    let config_dir = work_dir.join(".config").join("claude");
+    let config_dir = work_dir.join(".claude");
     fs::create_dir_all(&config_dir).expect("failed to create config dir");
     let config_path = config_dir.join("cc-statusline.json");
     fs::write(&config_path, config_content).expect("failed to write config");
@@ -518,10 +518,7 @@ fn run_with_config(work_dir: &PathBuf, json_input: &str, config_content: &str) -
     run_with_json_env(
         work_dir,
         json_input,
-        &[(
-            "XDG_CONFIG_HOME",
-            work_dir.join(".config").to_str().unwrap(),
-        )],
+        &[("HOME", work_dir.to_str().unwrap())],
     )
 }
 
@@ -530,14 +527,11 @@ fn config_file_missing_uses_defaults() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let path = temp_dir.path().to_path_buf();
 
-    // Point XDG_CONFIG_HOME to a nonexistent directory
+    // Point HOME to a directory without .claude/cc-statusline.json
     let stdout = run_with_json_env(
         &path,
         r#"{"model": {"display_name": "Claude Test"}}"#,
-        &[(
-            "XDG_CONFIG_HOME",
-            path.join("nonexistent").to_str().unwrap(),
-        )],
+        &[("HOME", path.join("nonexistent").to_str().unwrap())],
     );
 
     // Should still show the model (default behavior)
@@ -609,7 +603,7 @@ fn config_file_invalid_json_warns_and_uses_defaults() {
     let path = temp_dir.path().to_path_buf();
 
     // Create invalid config
-    let config_dir = path.join(".config").join("claude");
+    let config_dir = path.join(".claude");
     fs::create_dir_all(&config_dir).expect("failed to create config dir");
     let config_path = config_dir.join("cc-statusline.json");
     fs::write(&config_path, "{invalid json}").expect("failed to write config");
@@ -618,7 +612,7 @@ fn config_file_invalid_json_warns_and_uses_defaults() {
     let binary = get_binary_path();
     let mut cmd = Command::new(&binary);
     cmd.current_dir(&path)
-        .env("XDG_CONFIG_HOME", path.join(".config").to_str().unwrap())
+        .env("HOME", path.to_str().unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -658,17 +652,14 @@ fn config_init_creates_file() {
     let binary = get_binary_path();
     let output = Command::new(&binary)
         .arg("--config-init")
-        .env("XDG_CONFIG_HOME", path.join(".config").to_str().unwrap())
+        .env("HOME", path.to_str().unwrap())
         .current_dir(&path)
         .output()
         .expect("failed to run --config-init");
 
     assert!(output.status.success(), "config-init should succeed");
 
-    let config_path = path
-        .join(".config")
-        .join("claude")
-        .join("cc-statusline.json");
+    let config_path = path.join(".claude").join("cc-statusline.json");
     assert!(config_path.exists(), "Config file should be created");
 
     let content = fs::read_to_string(&config_path).expect("failed to read config");
