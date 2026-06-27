@@ -265,6 +265,11 @@ fn render_component(name: &str, view: &StatusView) -> Option<String> {
         "pr_state" => {
             let pr = view.pr.as_ref()?;
             let state_lower = pr.state.to_lowercase();
+            // Empty/whitespace state would emit bare color codes with no text;
+            // skip the component instead of polluting the row with no-op ANSI.
+            if state_lower.trim().is_empty() {
+                return None;
+            }
             let color = match state_lower.as_str() {
                 "open" => TN_GREEN,
                 "merged" => TN_PURPLE,
@@ -545,6 +550,24 @@ mod tests {
         assert_eq!(
             render_component("tokens", &v),
             Some(format!("{TN_GRAY}5K/1.5M{RESET}"))
+        );
+    }
+
+    #[test]
+    fn render_pr_state_skips_empty() {
+        let mut v = empty_view();
+        v.pr = Some(PrCacheData {
+            state: String::new(),
+            ..Default::default()
+        });
+        assert_eq!(render_component("pr_state", &v), None);
+
+        if let Some(pr) = v.pr.as_mut() {
+            pr.state = "open".to_string();
+        }
+        assert_eq!(
+            render_component("pr_state", &v),
+            Some(format!("{TN_GREEN}open{RESET}"))
         );
     }
 
