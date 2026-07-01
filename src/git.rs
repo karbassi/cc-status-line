@@ -88,35 +88,30 @@ pub(crate) struct GitRepo {
 }
 
 impl GitRepo {
-    /// Compute diff stats using git index - simplified, just count modified files
+    /// Count tracked files that differ between the index and the working tree.
+    ///
+    /// Uses gix's content-aware status (the same racy-clean handling git does), so a
+    /// file whose mtime drifted but whose content is unchanged is NOT counted — the
+    /// old mtime-only heuristic reported those as false positives. Untracked files are
+    /// excluded (dirwalk disabled), matching the previous index-only semantics; like
+    /// git's own dirty check this compares worktree-vs-index, not index-vs-HEAD, so
+    /// staged-only changes aren't counted. Line counts aren't computed.
     fn diff_stats(&self) -> Option<(u32, u32, u32)> {
-        let index = self.repo.index().ok()?;
-        let workdir = self.repo.work_dir()?;
-        let mut files = 0u32;
+        let files = self
+            .repo
+            .status(gix::progress::Discard)
+            .ok()?
+            .index_worktree_rewrites(None)
+            .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: true })
+            .index_worktree_options_mut(|opts| {
+                opts.dirwalk_options = None;
+            })
+            .into_index_worktree_iter(Vec::new())
+            .ok()?
+            // Count every yielded item, including per-path `Err`s: for a status line an
+            // errored/unreadable path is "unknown, treat as dirty", never silently dropped.
+            .count() as u32;
 
-        for entry in index.entries() {
-            let path_bstr = entry.path(&index);
-            let path_str = std::str::from_utf8(path_bstr.as_ref()).ok()?;
-            let file_path = workdir.join(path_str);
-
-            if let Ok(metadata) = fs::metadata(&file_path) {
-                let mtime = metadata
-                    .modified()
-                    .ok()?
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()?
-                    .as_secs();
-                let index_mtime = u64::from(entry.stat.mtime.secs);
-
-                if mtime != index_mtime {
-                    files += 1;
-                }
-            } else {
-                files += 1; // File deleted
-            }
-        }
-
-        // gix doesn't easily give line counts, so just return file count
         Some((files, 0, 0))
     }
 

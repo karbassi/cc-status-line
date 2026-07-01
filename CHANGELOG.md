@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Changed-files count no longer reports false positives. It was comparing only each tracked file's mtime against the index, so a file that was touched but not edited (checkout, formatter re-save, `git pull`, symlink target drift) was counted as changed even though `git status` considered the repo clean. It now uses gitoxide's content-aware status (same racy-clean handling as git), so mtime-only drift is ignored.
+
 ## [0.1.8] - 2026-06-27
 
 ### Changed
