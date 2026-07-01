@@ -191,6 +191,30 @@ fn detect_changed_files() {
     );
 }
 
+/// Regression: a tracked file whose mtime changed but whose content did not must
+/// NOT be counted as changed. The old mtime-only heuristic reported these as false
+/// positives (a clean repo showing "N files"); content-aware status ignores them.
+#[test]
+fn mtime_bump_without_content_change_is_clean() {
+    let (_temp_dir, repo_path) = create_git_repo();
+    make_commit(&repo_path, "initial commit");
+
+    // Bump mtime into the past without touching content.
+    let file_path = repo_path.join("file-initial-commit.txt");
+    Command::new("touch")
+        .args(["-t", "202001010000", file_path.to_str().unwrap()])
+        .output()
+        .expect("failed to touch file");
+
+    let stdout = run_with_json(&repo_path, "{}");
+
+    assert!(
+        !stdout.contains("file"),
+        "Clean repo (mtime-only drift) must not report changed files: {}",
+        stdout
+    );
+}
+
 // =============================================================================
 // JSON Input Tests
 // =============================================================================
