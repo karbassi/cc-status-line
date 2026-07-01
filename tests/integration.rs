@@ -194,6 +194,9 @@ fn detect_changed_files() {
 /// Regression: a tracked file whose mtime changed but whose content did not must
 /// NOT be counted as changed. The old mtime-only heuristic reported these as false
 /// positives (a clean repo showing "N files"); content-aware status ignores them.
+///
+/// Unix-only: it drives mtime drift via `touch -t`, which isn't available on Windows.
+#[cfg(unix)]
 #[test]
 fn mtime_bump_without_content_change_is_clean() {
     let (_temp_dir, repo_path) = create_git_repo();
