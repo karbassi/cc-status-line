@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-01
+
 ### Fixed
 
 - Changed-files count no longer reports false positives. It was comparing only each tracked file's mtime against the index, so a file that was touched but not edited (checkout, formatter re-save, `git pull`, symlink target drift) was counted as changed even though `git status` considered the repo clean. It now uses gitoxide's content-aware status (same racy-clean handling as git), so mtime-only drift is ignored.
