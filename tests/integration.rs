@@ -199,12 +199,20 @@ fn mtime_bump_without_content_change_is_clean() {
     let (_temp_dir, repo_path) = create_git_repo();
     make_commit(&repo_path, "initial commit");
 
-    // Bump mtime into the past without touching content.
+    // Bump mtime into the past without touching content. Assert touch actually
+    // succeeded, otherwise the test could pass vacuously (mtime never drifted).
     let file_path = repo_path.join("file-initial-commit.txt");
-    Command::new("touch")
-        .args(["-t", "202001010000", file_path.to_str().unwrap()])
+    let touch = Command::new("touch")
+        .arg("-t")
+        .arg("202001010000")
+        .arg(&file_path)
         .output()
-        .expect("failed to touch file");
+        .expect("failed to run touch");
+    assert!(
+        touch.status.success(),
+        "touch failed to set mtime: {}",
+        String::from_utf8_lossy(&touch.stderr)
+    );
 
     let stdout = run_with_json(&repo_path, "{}");
 
