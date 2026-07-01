@@ -108,7 +108,8 @@ impl GitRepo {
             })
             .into_index_worktree_iter(Vec::new())
             .ok()?
-            .filter_map(Result::ok)
+            // Count every yielded item, including per-path `Err`s: for a status line an
+            // errored/unreadable path is "unknown, treat as dirty", never silently dropped.
             .count() as u32;
 
         Some((files, 0, 0))
